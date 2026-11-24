@@ -4771,12 +4771,65 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// VOP2 `v_pk_fmac_f16`: each half of src0 times the same half of src1,
+    /// plus that half of the destination, as `v_pk_fma_f16` computes it.
+    fn pk_fmac_f16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() || v.clamp || v.omod != 0 {
+            return Err("modifiers on v_pk_fmac_f16");
+        }
+        if !matches!(
+            v.src.first(),
+            Some(Operand::Vector { .. } | Operand::Scalar { .. })
+        ) {
+            return Err("a constant source of v_pk_fmac_f16");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("an accumulator");
+        };
+        let (a, b) = (self.src(inst, 0)?, self.src(inst, 1)?);
+        let d = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let (k16, m16) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+        let mut halves = [a; 2];
+        for (high, out) in halves.iter_mut().enumerate() {
+            let mut f = [a, b, d];
+            for x in &mut f {
+                let h = if high == 1 {
+                    self.s.m.bin(c, Bin::LShr, *x, k16)
+                } else {
+                    *x
+                };
+                let h = self.s.m.bin(c, Bin::And, h, m16);
+                *x = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+            }
+            // shortcut: FMad in f32, as v_fma_f16.
+            let r = self.fmad(f[0], f[1], f[2]);
+            let r = self
+                .s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r]);
+            *out = self.s.m.bin(c, Bin::And, r, m16);
+        }
+        let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+        let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+        self.write(inst, Reg::V(reg), r, guard);
+        Ok(())
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        if op == "fmac_f16" {
+            return self.pk_fmac_f16(inst, guard);
+        }
         let float = op.ends_with("_f16");
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,

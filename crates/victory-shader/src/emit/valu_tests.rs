@@ -937,3 +937,26 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// VOP2 `v_pk_fmac_f16` multiplies matching halves of src0 and src1 and adds
+/// the same half of its destination.
+#[test]
+fn pk_fmac_f16_accumulates_each_half_into_its_destination() {
+    // [src0, src1, accumulator], expected (exact in f16).
+    let cases: &[([u32; 4], u32)] = &[
+        // lo 1.5 * 2.0 + 0.5 = 3.5, hi -1.0 * 3.0 + 1.0 = -2.0
+        ([0xBC00_3E00, 0x4200_4000, 0x3C00_3800, 0], 0xC000_4300),
+        // lo 2.0 * 2.0 + 4.0 = 8.0, hi 0.5 * 0.5 + 0.25 = 0.5
+        ([0x3800_4000, 0x3800_4000, 0x3400_4400, 0], 0x3800_4800),
+    ];
+    let body = [
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3 (the accumulator)
+        // VOP2 v_pk_fmac_f16 v0, v1, v2 (opcode 0x3C)
+        0x3C << 25 | 2 << 9 | u32::from(vgpr(1)),
+    ];
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(got, cases[i].1, "{backend}: v_pk_fmac_f16 {inp:x?}");
+    });
+}
