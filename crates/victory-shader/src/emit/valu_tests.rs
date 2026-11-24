@@ -937,3 +937,22 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// The 64-bit integer `v_cmp_f_*` and `v_cmp_t_*` are false and true.
+#[test]
+fn cmp_f_and_t_64_bit_integers() {
+    for (name, op, want) in [
+        ("v_cmp_f_i64", 0x0A0, 0),
+        ("v_cmp_t_i64", 0x0A7, 1),
+        ("v_cmp_f_u64", 0x0E0, 0),
+        ("v_cmp_t_u64", 0x0E7, 1),
+    ] {
+        // v_cmp_*_e64 s6, v[1:2], v[3:4]; v_cndmask_b32_e64 v0, 0, 1, s6
+        let [c0, c1] = vop3(op, 6, vgpr(1), vgpr(3), 0);
+        let [m0, m1] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        let shader = build_valu_cs(&[c0, c1, m0, m1]);
+        run_cases(&shader, &[[1, 2, 3, 4], [0; 4]], |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}
