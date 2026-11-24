@@ -937,3 +937,22 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_cvt_off_f32_i4` reads src0[3:0] as a signed nibble in sixteenths and
+/// ignores the other bits.
+#[test]
+fn cvt_off_f32_i4_converts_signed_nibbles() {
+    let cases: Vec<[u32; 4]> = (0..16u32).map(|n| [0xABCD_EF00 | n, 0, 0, 0]).collect();
+    // VOP1 v_cvt_off_f32_i4 = 0x0E.
+    let shader = build_valu_cs(&[vop1(0x0E, 0, vgpr(1))]);
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        let n = (inp[0] << 28) as i32 >> 28;
+        let want = n as f32 / 16.0;
+        assert_eq!(
+            f32::from_bits(got),
+            want,
+            "{backend}: v_cvt_off_f32_i4 {:#x}",
+            inp[0]
+        );
+    });
+}

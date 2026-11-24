@@ -4023,6 +4023,17 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_off_f32_i4" => {
+                // src0[3:0] as a signed nibble, in sixteenths: -0.5 to 0.4375.
+                let a = s(self, 0)?;
+                let k28 = self.s.m.i32(28);
+                let t = self.s.m.bin(c, Bin::Shl, a, k28);
+                let t = self.s.m.bin(c, Bin::AShr, t, k28);
+                let t = self.s.m.cast(c, Cast::SiToFp, t, self.s.t.f32);
+                let sixteenth = self.s.m.f32(0.0625f32.to_bits());
+                let r = self.s.m.bin(c, Bin::Mul, t, sixteenth);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
