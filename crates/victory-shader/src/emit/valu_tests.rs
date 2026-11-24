@@ -1015,3 +1015,118 @@ fn f64_arithmetic_matches_ieee() {
         }
     }
 }
+
+/// `v_ldexp_f64` rounds x * 2^n once, denormal results included; the f64
+/// `v_frexp_*` split a value (denormals too) into a mantissa in [0.5, 1) and
+/// an exponent, zero, infinities and NaN keeping their value and exponent 0.
+#[test]
+fn f64_ldexp_and_frexp() {
+    let pow2 = |n: i32| f64::from_bits(((n + 1023) as u64) << 52);
+    let b = f64::from_bits;
+    // (x, n, x * 2^n) for x * 2^n where 2^n is a normal f64: one rounding.
+    let mut cases: Vec<(f64, i32, f64)> = [
+        (1.5, 10),
+        (-1.0, -1022),
+        (1e-300, -100),
+        (b(1), 1000),
+        (b(3), 1),
+        (b(0x000F_FFFF_FFFF_FFFF), 1),
+        (1.0, -1022),
+        (12345.678, -1000),
+        (-0.0, 5),
+        (f64::INFINITY, -1000),
+    ]
+    .iter()
+    .map(|&(x, n)| (x, n, x * pow2(n)))
+    .collect();
+    cases.extend([
+        (1.0, 1023, pow2(1023)),
+        (1.0, 1024, f64::INFINITY),
+        (-1.0, 1024, f64::NEG_INFINITY),
+        (1.0, -1074, b(1)),
+        (1.0, -1075, 0.0),  // a tie, to even
+        (1.5, -1075, b(1)), // 0.75 of the smallest denormal rounds up
+        (3.0, -1076, b(1)),
+        (1.0, -1076, 0.0),
+        (-1.0, i32::MIN, -0.0),
+        (1.0, i32::MAX, f64::INFINITY),
+        (b(1), 1074, 1.0),
+        (b(1), 2000, pow2(926)),
+        (b(1), 2100, f64::INFINITY),
+    ]);
+    let words = |x: f64, n: u32| {
+        let b = x.to_bits();
+        [b as u32, (b >> 32) as u32, n, 0]
+    };
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, n, _)| words(x, n as u32)).collect();
+    for half in 0..2 {
+        // VOP3 v_ldexp_f64 v[0:1], v[1:2], v3 (0x168).
+        let mut body = vop3(0x168, 0, vgpr(1), vgpr(3), 0).to_vec();
+        if half == 1 {
+            body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+        }
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let (x, n, want) = cases[i];
+            let want = (want.to_bits() >> (32 * half)) as u32;
+            assert_eq!(
+                got, want,
+                "{backend}: v_ldexp_f64 ({x:e}, {n}) dword {half}"
+            );
+        });
+    }
+    // frexp: the mantissa and exponent multiply back to x.
+    let values = [
+        1.0,
+        -3.5,
+        0.1,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        b(1),
+        b(0x800F_FFFF_FFFF_FFFF),
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<[u32; 4]> = values.iter().map(|&x| words(x, 0)).collect();
+    // VOP1 v_frexp_exp_i32_f64 = 0x3C: v0 = exponent.
+    let exp_shader = build_valu_cs(&[vop1(0x3C, 0, vgpr(1))]);
+    let mut exps = vec![0i32; values.len()];
+    run_cases(&exp_shader, &inputs, |_, i, _, got| exps[i] = got as i32);
+    for half in 0..2 {
+        // VOP1 v_frexp_mant_f64 = 0x3D: v[0:1] = mantissa.
+        let mut body = vec![vop1(0x3D, 0, vgpr(1))];
+        if half == 1 {
+            body.push(vop1(0x001, 0, vgpr(1)));
+        }
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let x = values[i];
+            let e = exps[i];
+            if x == 0.0 || x.is_infinite() {
+                assert_eq!(e, 0, "{backend}: v_frexp_exp_i32_f64 {x:e}");
+                assert_eq!(
+                    got,
+                    (x.to_bits() >> (32 * half)) as u32,
+                    "{backend}: mant {x:e}"
+                );
+            } else if half == 1 {
+                // The high dword: sign, exponent field 1022 (in [0.5, 1)),
+                // and the top fraction bits of x scaled by 2^-e (in two
+                // exact steps, as 2^-e may be out of range).
+                let first = e.clamp(-1022, 1023);
+                let m = x / pow2(first) / pow2(e - first);
+                assert!(
+                    (0.5..1.0).contains(&m.abs()),
+                    "{backend}: frexp {x:e} exponent {e}"
+                );
+                assert_eq!(
+                    got,
+                    (m.to_bits() >> 32) as u32,
+                    "{backend}: v_frexp_mant_f64 {x:e}"
+                );
+            }
+        });
+    }
+}

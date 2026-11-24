@@ -1400,6 +1400,100 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, zeros, signed, r)
     }
 
+    /// `frexp` of the f64 `x`: the mantissa in [0.5, 1) with the sign, the
+    /// exponent (an i64), and whether `x` is zero, infinite or NaN (which
+    /// keep their value and have exponent 0). A denormal is first scaled by
+    /// 2^64, exactly.
+    fn frexp64(&mut self, x: V) -> (V, V, V) {
+        let c = self.cur;
+        let (f64t, i64t) = (self.s.m.double(), self.s.m.int(64));
+        let k = |l: &mut Self, n: i64| l.s.m.int_const(i64t, n);
+        let field = |l: &mut Self, b: V| {
+            let (k52, k7ff) = (k(l, 52), k(l, 0x7FF));
+            let e = l.s.m.bin(c, Bin::LShr, b, k52);
+            l.s.m.bin(c, Bin::And, e, k7ff)
+        };
+        let bits = self.s.m.cast(c, Cast::Bitcast, x, i64t);
+        let e = field(self, bits);
+        let two64 = k(self, (2f64.powi(64)).to_bits() as i64);
+        let two64 = self.s.m.cast(c, Cast::Bitcast, two64, f64t);
+        let y = self.s.m.bin(c, Bin::Mul, x, two64);
+        let ybits = self.s.m.cast(c, Cast::Bitcast, y, i64t);
+        let ye = field(self, ybits);
+        let k64 = k(self, 64);
+        let ye = self.s.m.bin(c, Bin::Sub, ye, k64);
+        let zero = k(self, 0);
+        let denorm = self.s.m.cmp(c, pred::EQ, e, zero);
+        let src = self.s.m.select(c, denorm, ybits, bits);
+        let e = self.s.m.select(c, denorm, ye, e);
+        let k1022 = k(self, 1022);
+        let exp = self.s.m.bin(c, Bin::Sub, e, k1022);
+        let keep = k(self, 0x800F_FFFF_FFFF_FFFF_u64 as i64);
+        let m = self.s.m.bin(c, Bin::And, src, keep);
+        let half = k(self, 1022 << 52);
+        let m = self.s.m.bin(c, Bin::Or, m, half);
+        let m = self.s.m.cast(c, Cast::Bitcast, m, f64t);
+        let mag = k(self, i64::MAX);
+        let mag = self.s.m.bin(c, Bin::And, bits, mag);
+        let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
+        let raw = field(self, bits);
+        let k7ff = k(self, 0x7FF);
+        let is_special = self.s.m.cmp(c, pred::EQ, raw, k7ff);
+        let special = self.s.m.bin(c, Bin::Or, is_zero, is_special);
+        (m, exp, special)
+    }
+
+    /// `x * 2^n` (`n` an i32), rounded once: with x's mantissa m in
+    /// [0.5, 1) and exponent e, a normal result m * 2^(e + n) is built from
+    /// its bits, a denormal one is m * 2^(e + n + 64) (normal, exact) times
+    /// 2^-64, and beyond the range it is infinite or zero.
+    fn ldexp64(&mut self, x: V, n: V) -> V {
+        let c = self.cur;
+        let (f64t, i64t) = (self.s.m.double(), self.s.m.int(64));
+        let k = |l: &mut Self, v: i64| l.s.m.int_const(i64t, v);
+        let (m, e, special) = self.frexp64(x);
+        let n = self.s.m.cast(c, Cast::SExt, n, i64t);
+        let big = self.s.m.bin(c, Bin::Add, e, n);
+        let mbits = self.s.m.cast(c, Cast::Bitcast, m, i64t);
+        let sign = k(self, i64::MIN);
+        let sign = self.s.m.bin(c, Bin::And, mbits, sign);
+        let frac = k(self, 0x000F_FFFF_FFFF_FFFF);
+        let frac = self.s.m.bin(c, Bin::And, mbits, frac);
+        let with_exp = |l: &mut Self, field: V| {
+            let k52 = k(l, 52);
+            let f = l.s.m.bin(c, Bin::Shl, field, k52);
+            let f = l.s.m.bin(c, Bin::Or, f, frac);
+            let f = l.s.m.bin(c, Bin::Or, f, sign);
+            l.s.m.cast(c, Cast::Bitcast, f, f64t)
+        };
+        // A normal result: exponent field 1022 + E for E in [-1021, 1024].
+        let (k1022, k1086) = (k(self, 1022), k(self, 1022 + 64));
+        let lo = k(self, -1085);
+        let low = self.s.m.cmp(c, pred::SLT, big, lo);
+        let hi = k(self, 1024);
+        let high = self.s.m.cmp(c, pred::SGT, big, hi);
+        let mut e = self.s.m.select(c, low, lo, big);
+        e = self.s.m.select(c, high, hi, e);
+        let nf = self.s.m.bin(c, Bin::Add, e, k1022);
+        let normal = with_exp(self, nf);
+        // A denormal result, for E in [-1085, -1022].
+        let df = self.s.m.bin(c, Bin::Add, e, k1086);
+        let scaled = with_exp(self, df);
+        let down = k(self, (2f64.powi(-64)).to_bits() as i64);
+        let down = self.s.m.cast(c, Cast::Bitcast, down, f64t);
+        let denorm = self.s.m.bin(c, Bin::Mul, scaled, down);
+        let inf = k(self, 0x7FF0_0000_0000_0000);
+        let inf = self.s.m.bin(c, Bin::Or, inf, sign);
+        let inf = self.s.m.cast(c, Cast::Bitcast, inf, f64t);
+        let zero = self.s.m.cast(c, Cast::Bitcast, sign, f64t);
+        let min_normal = k(self, -1021);
+        let is_denorm = self.s.m.cmp(c, pred::SLT, big, min_normal);
+        let r = self.s.m.select(c, is_denorm, denorm, normal);
+        let r = self.s.m.select(c, high, inf, r);
+        let r = self.s.m.select(c, low, zero, r);
+        self.s.m.select(c, special, x, r)
+    }
+
     /// [`Self::max_min`] for f64: DXIL's FMax/FMin, with -0 below +0.
     fn max_min64(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
@@ -3784,6 +3878,25 @@ impl<'a> Lower<'a> {
                     }
                     _ => self.max_min64(name == "v_max_f64", a, b),
                 };
+                self.write_f64(inst, r, guard)
+            }
+            "v_frexp_mant_f64" | "v_frexp_exp_i32_f64" => {
+                let a = self.fsrc64(inst, 0)?;
+                let (m, e, special) = self.frexp64(a);
+                if name == "v_frexp_mant_f64" {
+                    let r = self.s.m.select(c, special, a, m);
+                    self.write_f64(inst, r, guard)
+                } else {
+                    let e = self.s.m.cast(c, Cast::Trunc, e, self.s.t.i32);
+                    let z = self.s.m.i32(0);
+                    let r = self.s.m.select(c, special, z, e);
+                    int(self, r)
+                }
+            }
+            "v_ldexp_f64" => {
+                let a = self.fsrc64(inst, 0)?;
+                let n = s(self, 1)?;
+                let r = self.ldexp64(a, n);
                 self.write_f64(inst, r, guard)
             }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
