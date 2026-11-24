@@ -4453,6 +4453,12 @@ impl<'a> Lower<'a> {
             "v_max_i16",
             "v_min_u16",
             "v_min_i16",
+            "v_min3_i16",
+            "v_min3_u16",
+            "v_max3_i16",
+            "v_max3_u16",
+            "v_med3_i16",
+            "v_med3_u16",
             "v_cvt_u16_f16",
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
@@ -4624,6 +4630,45 @@ impl<'a> Lower<'a> {
                 let nan = self.s.m.cmp(c, pred::UNO, a, a);
                 let z = self.s.m.i32(0);
                 self.s.m.select(c, nan, z, r)
+            }
+            "v_min3_i16" | "v_min3_u16" | "v_max3_i16" | "v_max3_u16" | "v_med3_i16"
+            | "v_med3_u16" => {
+                let mut x = [
+                    self.half_src(inst, 0)?,
+                    self.half_src(inst, 1)?,
+                    self.half_src(inst, 2)?,
+                ];
+                let signed = name.ends_with("_i16");
+                if signed {
+                    let k16 = self.s.m.i32(16);
+                    for x in &mut x {
+                        let t = self.s.m.bin(c, Bin::Shl, *x, k16);
+                        *x = self.s.m.bin(c, Bin::AShr, t, k16);
+                    }
+                }
+                let (lt, gt) = if signed {
+                    (pred::SLT, pred::SGT)
+                } else {
+                    (pred::IULT, pred::IUGT)
+                };
+                let mut pick = |p, a, b| {
+                    let t = self.s.m.cmp(c, p, a, b);
+                    self.s.m.select(c, t, a, b)
+                };
+                let [a, b, d] = x;
+                if name.starts_with("v_min3") {
+                    let t = pick(lt, a, b);
+                    pick(lt, t, d)
+                } else if name.starts_with("v_max3") {
+                    let t = pick(gt, a, b);
+                    pick(gt, t, d)
+                } else {
+                    // max(min(a, b), min(max(a, b), d))
+                    let lo = pick(lt, a, b);
+                    let hi = pick(gt, a, b);
+                    let t = pick(lt, hi, d);
+                    pick(gt, lo, t)
+                }
             }
             _ => {
                 let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);

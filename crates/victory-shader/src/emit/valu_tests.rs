@@ -937,3 +937,44 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// The 16-bit integer `v_min3`/`v_max3`/`v_med3` compare the low halves,
+/// signed or unsigned, and ignore the high halves.
+#[test]
+fn min3_max3_med3_16_bit_integers() {
+    let cases = [
+        [0x1234_0001, 0xFFFF_8000, 0x0000_7FFF, 0],
+        [0x0000_FFFF, 0xABCD_0002, 0x0000_0003, 0],
+        [0x0000_0005, 0x0000_0005, 0x0000_FFFB, 0],
+        [0x7FFF_0010, 0x0000_0020, 0x8000_0018, 0],
+    ];
+    type Model = fn([i32; 3]) -> i32;
+    let ops: [(&str, u16, Model); 6] = [
+        ("v_min3_i16", 0x352, |x| x[0].min(x[1]).min(x[2])),
+        ("v_min3_u16", 0x353, |x| x[0].min(x[1]).min(x[2])),
+        ("v_max3_i16", 0x355, |x| x[0].max(x[1]).max(x[2])),
+        ("v_max3_u16", 0x356, |x| x[0].max(x[1]).max(x[2])),
+        ("v_med3_i16", 0x358, |mut x| {
+            x.sort();
+            x[1]
+        }),
+        ("v_med3_u16", 0x359, |mut x| {
+            x.sort();
+            x[1]
+        }),
+    ];
+    for (name, op, f) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let x = inp.map(|w| {
+                if name.ends_with("_i16") {
+                    i32::from(w as u16 as i16)
+                } else {
+                    i32::from(w as u16)
+                }
+            });
+            let want = f([x[0], x[1], x[2]]) as u32 & 0xFFFF;
+            assert_eq!(got & 0xFFFF, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}
