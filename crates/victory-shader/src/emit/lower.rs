@@ -5168,6 +5168,28 @@ impl<'a> Lower<'a> {
                 }
                 r
             }
+            "v_lerp_u8" => {
+                // Per byte: (src0 + src1 + bit 0 of src2's byte) >> 1.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (ff, one) = (k(self, 0xFF), k(self, 1));
+                let mut r = k(self, 0);
+                for i in 0..4 {
+                    let sh = k(self, 8 * i);
+                    let byte = |l: &mut Self, x| {
+                        let t = l.s.m.bin(c, Bin::LShr, x, sh);
+                        l.s.m.bin(c, Bin::And, t, ff)
+                    };
+                    let (x, y) = (byte(self, a), byte(self, b));
+                    let t = self.s.m.bin(c, Bin::LShr, d, sh);
+                    let rnd = self.s.m.bin(c, Bin::And, t, one);
+                    let sum = self.s.m.bin(c, Bin::Add, x, y);
+                    let sum = self.s.m.bin(c, Bin::Add, sum, rnd);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let avg = self.s.m.bin(c, Bin::Shl, avg, sh);
+                    r = self.s.m.bin(c, Bin::Or, r, avg);
+                }
+                r
+            }
             "v_bfm_b32" => {
                 // ((1 << src0[4:0]) - 1) << src1[4:0]
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

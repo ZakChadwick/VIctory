@@ -937,3 +937,25 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_lerp_u8` averages each byte of src0 and src1, rounding up where bit 0
+/// of the matching byte of src2 is set.
+#[test]
+fn lerp_u8_averages_bytes_with_rounding_bits() {
+    let cases = [
+        [0xFF00_80FF, 0xFF01_81FF, 0x0101_0101, 0],
+        [0xFF00_80FF, 0xFF01_81FF, 0x0000_0000, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0xFEFF_00FF, 0],
+        [0x0000_0000, 0x0101_0101, 0x0100_0001, 0],
+    ];
+    // VOP3 v_lerp_u8 = 0x14D.
+    let shader = build_valu_cs(&vop3(0x14D, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        let mut want = 0;
+        for i in (0..32).step_by(8) {
+            let byte = |w: u32| w >> i & 0xFF;
+            want |= ((byte(inp[0]) + byte(inp[1]) + (inp[2] >> i & 1)) >> 1) << i;
+        }
+        assert_eq!(got, want, "{backend}: v_lerp_u8 {inp:x?}");
+    });
+}
