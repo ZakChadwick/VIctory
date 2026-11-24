@@ -1015,3 +1015,85 @@ fn f64_arithmetic_matches_ieee() {
         }
     }
 }
+
+/// Conversions to and from f64: from f32 and 32-bit integers exactly, and to
+/// 32-bit integers toward zero, saturating, with NaN giving 0.
+#[test]
+fn f64_conversions() {
+    // VOP1 v_cvt_f64_f32 = 0x10, v_cvt_f64_i32 = 0x04, v_cvt_f64_u32 = 0x16:
+    // v[0:1] = cvt(v1).
+    let ints = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 123_456_789];
+    let floats = [
+        1.0f32,
+        -0.1,
+        f32::MAX,
+        f32::MIN_POSITIVE,
+        f32::INFINITY,
+        -0.0,
+    ];
+    type ToF64 = fn(u32) -> f64;
+    let ops: [(&str, u16, &[u32], ToF64); 3] = [
+        ("v_cvt_f64_i32", 0x04, &ints, |x| f64::from(x as i32)),
+        ("v_cvt_f64_u32", 0x16, &ints, f64::from),
+        ("v_cvt_f64_f32", 0x10, &[0; 0], |x| {
+            f64::from(f32::from_bits(x))
+        }),
+    ];
+    let float_bits: Vec<u32> = floats.iter().map(|f| f.to_bits()).collect();
+    for (name, op, inputs, f) in ops {
+        let inputs = if inputs.is_empty() {
+            &float_bits[..]
+        } else {
+            inputs
+        };
+        let cases: Vec<[u32; 4]> = inputs.iter().map(|&x| [x, 0, 0, 0]).collect();
+        for half in 0..2 {
+            let mut body = vec![vop1(op, 0, vgpr(1))];
+            if half == 1 {
+                body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+            }
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let want = (f(inp[0]).to_bits() >> (32 * half)) as u32;
+                assert_eq!(got, want, "{backend}: {name} {:#x} dword {half}", inp[0]);
+            });
+        }
+    }
+    // VOP1 v_cvt_i32_f64 = 0x03, v_cvt_u32_f64 = 0x15: v0 = cvt(v[1:2]).
+    let doubles = [
+        0.0,
+        -0.0,
+        1.9,
+        -1.9,
+        2147483647.5,
+        2147483648.0,
+        -2147483649.0,
+        4294967295.9,
+        4294967296.0,
+        1e300,
+        -1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let cases: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|d| {
+            let b = d.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    type FromF64 = fn(f64) -> u32;
+    let ops: [(&str, u16, FromF64); 2] = [
+        // Rust's float-to-int casts saturate and give 0 for NaN.
+        ("v_cvt_i32_f64", 0x03, |d| d as i32 as u32),
+        ("v_cvt_u32_f64", 0x15, |d| d as u32),
+    ];
+    for (name, op, f) in ops {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let d = f64::from_bits(u64::from(inp[1]) << 32 | u64::from(inp[0]));
+            assert_eq!(got, f(d), "{backend}: {name} {d:e}");
+        });
+    }
+}

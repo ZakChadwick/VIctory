@@ -3786,6 +3786,46 @@ impl<'a> Lower<'a> {
                 };
                 self.write_f64(inst, r, guard)
             }
+            "v_cvt_f64_f32" => {
+                let a = f(self, 0)?;
+                self.s.flags |= flags::DOUBLES;
+                let f64t = self.s.m.double();
+                let r = self.s.m.cast(c, Cast::FpExt, a, f64t);
+                self.write_f64(inst, r, guard)
+            }
+            "v_cvt_f64_i32" | "v_cvt_f64_u32" => {
+                let a = s(self, 0)?;
+                self.s.flags |= flags::DOUBLES | flags::DOUBLE_EXTENSIONS;
+                let f64t = self.s.m.double();
+                let op = if name == "v_cvt_f64_i32" {
+                    Cast::SiToFp
+                } else {
+                    Cast::UiToFp
+                };
+                let r = self.s.m.cast(c, op, a, f64t);
+                self.write_f64(inst, r, guard)
+            }
+            "v_cvt_i32_f64" | "v_cvt_u32_f64" => {
+                // Toward zero, saturating; NaN gives 0. The bounds are exact
+                // in f64, so the clamped value always converts.
+                let a = self.fsrc64(inst, 0)?;
+                self.s.flags |= flags::DOUBLE_EXTENSIONS;
+                let (lo, hi, op) = if name == "v_cvt_i32_f64" {
+                    (-2_147_483_648.0f64, 2_147_483_647.0f64, Cast::FpToSi)
+                } else {
+                    (0.0, 4_294_967_295.0, Cast::FpToUi)
+                };
+                let (lo, hi) = (self.s.m.f64(lo.to_bits()), self.s.m.f64(hi.to_bits()));
+                let t = self.s.m.cmp(c, pred::OLT, a, lo);
+                let x = self.s.m.select(c, t, lo, a);
+                let t = self.s.m.cmp(c, pred::OGT, x, hi);
+                let x = self.s.m.select(c, t, hi, x);
+                let r = self.s.m.cast(c, op, x, self.s.t.i32);
+                let nan = self.s.m.cmp(c, pred::UNO, a, a);
+                let z = self.s.m.i32(0);
+                let r = self.s.m.select(c, nan, z, r);
+                int(self, r)
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -4410,6 +4450,7 @@ impl<'a> Lower<'a> {
             f = self.s.op(c, "unary.f64", Attr::ReadNone, f64t, 7, &[f]);
         }
         let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
         let x = self.s.m.cast(c, Cast::Bitcast, f, i64t);
         let (lo, hi) = self.split64(x);
         self.write(inst, Reg::V(reg), lo, guard);
