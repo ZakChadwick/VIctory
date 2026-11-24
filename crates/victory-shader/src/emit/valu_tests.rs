@@ -937,3 +937,41 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_ldexp_f16` scales an f16 by 2 to a signed 16-bit power, rounding once,
+/// to infinity or to zero far out of range.
+#[test]
+fn ldexp_f16_scales_by_a_signed_16_bit_power() {
+    let n = |e: i16| u32::from(e as u16);
+    let cases: &[([u32; 4], u16)] = &[
+        ([0x3C00, 0xABCD_0003, 0, 0], 0x4800), // 1.0 * 2^3 (high half ignored)
+        ([0x3E00, n(-2), 0, 0], 0x3600),       // 1.5 * 2^-2
+        ([0xC000, n(1), 0, 0], 0xC400),        // -2.0 * 2
+        ([0x3C00, n(-24), 0, 0], 0x0001),      // smallest denormal
+        ([0x3E00, n(-25), 0, 0], 0x0001),      // 0.75 of it rounds up
+        ([0x3C00, n(-25), 0, 0], 0x0000),      // a tie rounds to even
+        ([0x3E00, n(-24), 0, 0], 0x0002),      // 1.5 units, a tie, to even
+        ([0x7BFF, n(0), 0, 0], 0x7BFF),        // the largest finite
+        ([0x0001, n(24), 0, 0], 0x3C00),       // a denormal scaled to 1.0
+        ([0x3C00, n(16), 0, 0], 0x7C00),       // overflow
+        ([0xBC00, n(i16::MAX), 0, 0], 0xFC00), // overflow, negative
+        ([0x3C00, n(i16::MIN), 0, 0], 0x0000), // underflow
+        ([0x7C00, n(-100), 0, 0], 0x7C00),     // infinity stays
+        ([0x8000, n(5), 0, 0], 0x8000),        // -0 stays
+        ([0x7E00, n(1), 0, 0], 0x7E00),        // NaN
+    ];
+    // VOP2 v_ldexp_f16 = 0x3B (VOP3 0x13B).
+    let shader = build_valu_cs(&vop3(0x13B, 0, vgpr(1), vgpr(2), 0));
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let (got, want) = (got as u16, cases[i].1);
+        if is_f16_nan(want) {
+            assert!(
+                is_f16_nan(got),
+                "{backend}: v_ldexp_f16 {inp:x?} = {got:#06x}"
+            );
+        } else {
+            assert_eq!(got, want, "{backend}: v_ldexp_f16 {inp:x?}");
+        }
+    });
+}

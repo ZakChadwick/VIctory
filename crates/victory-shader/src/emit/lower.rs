@@ -4460,7 +4460,7 @@ impl<'a> Lower<'a> {
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
-            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
+            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16" | "v_ldexp_f16")
         {
             return None;
         }
@@ -4501,6 +4501,59 @@ impl<'a> Lower<'a> {
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
             return float_result(self, f);
+        }
+        if name == "v_ldexp_f16" {
+            // src0 * 2^src1 (a signed 16-bit exponent). Every f16 is exact in
+            // f32 and needs at most 40 binades to over- or underflow f16, so
+            // the exponent is clamped to [-64, 64] and the f32 product is
+            // exact. It is encoded here rather than by the host's conversion,
+            // which may saturate and truncate: a normal result is exact in
+            // f16, a denormal one is rounded to nearest even in units of
+            // 2^-24, and from 65520 up it is infinite.
+            let a = self.half_fsrc(inst, 0)?;
+            let n = self.half_src(inst, 1)?;
+            let k16 = self.s.m.i32(16);
+            let n = self.s.m.bin(c, Bin::Shl, n, k16);
+            let n = self.s.m.bin(c, Bin::AShr, n, k16);
+            let (lo, hi) = (self.s.m.i32(-64i32 as u32), self.s.m.i32(64));
+            let t = self.s.m.cmp(c, pred::SLT, n, lo);
+            let n = self.s.m.select(c, t, lo, n);
+            let t = self.s.m.cmp(c, pred::SGT, n, hi);
+            let n = self.s.m.select(c, t, hi, n);
+            let (bias, k23) = (self.s.m.i32(127), self.s.m.i32(23));
+            let e = self.s.m.bin(c, Bin::Add, n, bias);
+            let e = self.s.m.bin(c, Bin::Shl, e, k23);
+            let scale = self.as_float(e);
+            let mut r = self.s.m.bin(c, Bin::Mul, a, scale);
+            if v.omod != 0 {
+                return Err("an output modifier on a 16-bit operation");
+            }
+            if v.clamp {
+                r = self.unary(7, r);
+            }
+            let bits = self.as_int(r);
+            let k16 = self.s.m.i32(16);
+            let sign = self.s.m.bin(c, Bin::LShr, bits, k16);
+            let m = self.s.m.i32(0x8000);
+            let sign = self.s.m.bin(c, Bin::And, sign, m);
+            let mag = self.unary(6, r);
+            let normal = self
+                .s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r]);
+            let units = self.s.m.f32((2.0f32).powi(24).to_bits());
+            let q = self.s.m.bin(c, Bin::Mul, mag, units);
+            let q = self.unary(26, q);
+            let q = self.s.m.cast(c, Cast::FpToUi, q, i32t);
+            let denorm = self.s.m.bin(c, Bin::Or, sign, q);
+            let inf = self.s.m.i32(0x7C00);
+            let inf = self.s.m.bin(c, Bin::Or, sign, inf);
+            let min = self.s.m.f32((2.0f32).powi(-14).to_bits());
+            let big = self.s.m.f32(65520.0f32.to_bits());
+            let small = self.s.m.cmp(c, pred::OLT, mag, min);
+            let huge = self.s.m.cmp(c, pred::OGE, mag, big);
+            let h = self.s.m.select(c, small, denorm, normal);
+            let h = self.s.m.select(c, huge, inf, h);
+            return self.write_half(inst, h, guard);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
