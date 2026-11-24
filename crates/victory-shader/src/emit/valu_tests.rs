@@ -937,3 +937,65 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8` and `v_mqsad_u32_u8`: four sums
+/// of absolute byte differences between src1 and the windows of src0 at
+/// byte offsets 0-3, added to 16-bit (pk) or 32-bit accumulators in src2;
+/// the m forms skip the bytes where src1 is 0.
+#[test]
+fn quad_sads_match_the_isa() {
+    fn sad(window: u32, reference: u32, masked: bool) -> u32 {
+        (0..4)
+            .map(|b| {
+                let (p, q) = (window >> (8 * b) & 0xFF, reference >> (8 * b) & 0xFF);
+                if masked && q == 0 { 0 } else { p.abs_diff(q) }
+            })
+            .sum()
+    }
+    // v[1:2] = src0, v3 = src1, v[4:7] = src2 (v5..v7 set below).
+    let more = [0x0003_FFF0, 0x1111_2222, 0xFFFF_FFF0];
+    let cases = [
+        [0x8070_6050, 0x0403_0201, 0x7F00_10FF, 0x0005_0001],
+        [0xFFFF_FFFF, 0x0000_0000, 0x0000_0000, 0xFFFF_FFF0],
+        [0x0102_0304, 0x0506_0708, 0x0807_0605, 0x1234_5678],
+    ];
+    for (name, op, pk, masked) in [
+        ("v_qsad_pk_u16_u8", 0x172, true, false),
+        ("v_mqsad_pk_u16_u8", 0x173, true, true),
+        ("v_mqsad_u32_u8", 0x175, false, true),
+    ] {
+        for j in 0..if pk { 2u8 } else { 4 } {
+            let mut body = Vec::new();
+            for (n, &w) in more.iter().enumerate() {
+                body.extend([vop1(0x001, 5 + n as u8, 255), w]); // v_mov_b32 v5+n, literal
+            }
+            body.extend(vop3(op, 0, vgpr(1), vgpr(3), vgpr(4)));
+            if j > 0 {
+                body.push(vop1(0x001, 0, vgpr(j))); // v_mov_b32 v0, vj
+            }
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let src0 = u64::from(inp[1]) << 32 | u64::from(inp[0]);
+                let acc = [inp[3], more[0], more[1], more[2]];
+                let sums: Vec<u32> = (0..4)
+                    .map(|w| {
+                        let window = (src0 >> (8 * w)) as u32;
+                        let a = if pk {
+                            acc[w / 2] >> (16 * (w % 2)) & 0xFFFF
+                        } else {
+                            acc[w]
+                        };
+                        a.wrapping_add(sad(window, inp[2], masked))
+                    })
+                    .collect();
+                let j = usize::from(j);
+                let want = if pk {
+                    sums[2 * j] & 0xFFFF | (sums[2 * j + 1] & 0xFFFF) << 16
+                } else {
+                    sums[j]
+                };
+                assert_eq!(got, want, "{backend}: {name} dword {j} {inp:x?}");
+            });
+        }
+    }
+}

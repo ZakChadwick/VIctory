@@ -3744,6 +3744,92 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8" => {
+                // Four sums of absolute byte differences between src1 and the
+                // 4-byte windows of src0 at byte offsets 0-3, each added to its
+                // accumulator in src2: 16-bit fields (pk) or dwords. The m
+                // forms skip the bytes where src1 (the reference) is 0.
+                if v.clamp || v.abs != 0 || v.neg != 0 {
+                    return Err("modifiers on a quad SAD");
+                }
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let pk = name.ends_with("_pk_u16_u8");
+                let masked = name.starts_with("v_mqsad");
+                let x = self.src64(inst, 0)?;
+                let reference = s(self, 1)?;
+                let acc_dwords = if pk { 2 } else { 4 };
+                let acc_regs = match v.src.get(2) {
+                    Some(Operand::Vector { reg, .. }) => {
+                        (0..acc_dwords).map(|k| Reg::V(reg + k)).collect::<Vec<_>>()
+                    }
+                    Some(Operand::Scalar { code, .. }) if *code != NULL => {
+                        (0..acc_dwords).map(|k| Reg::S(code + k)).collect()
+                    }
+                    _ => return Err("a quad SAD accumulator"),
+                };
+                let mut acc = Vec::new();
+                for r in acc_regs {
+                    let a = inst.read(r).ok_or("a quad SAD accumulator")?;
+                    acc.push(self.i32_of(a)?);
+                }
+                let i64t = self.s.m.int(64);
+                let (ff, zero) = (k(self, 0xFF), k(self, 0));
+                let mut sums = Vec::new();
+                for w in 0..4u32 {
+                    let sh = self.s.m.int_const(i64t, i64::from(8 * w));
+                    let win = self.s.m.bin(c, Bin::LShr, x, sh);
+                    let win = self.s.m.cast(c, Cast::Trunc, win, self.s.t.i32);
+                    let mut sum = if pk {
+                        let a = acc[(w / 2) as usize];
+                        let a = if w % 2 == 1 {
+                            let k16 = k(self, 16);
+                            self.s.m.bin(c, Bin::LShr, a, k16)
+                        } else {
+                            a
+                        };
+                        let m16 = k(self, 0xFFFF);
+                        self.s.m.bin(c, Bin::And, a, m16)
+                    } else {
+                        acc[w as usize]
+                    };
+                    for b in 0..4u32 {
+                        let bs = k(self, 8 * b);
+                        let p = self.s.m.bin(c, Bin::LShr, win, bs);
+                        let p = self.s.m.bin(c, Bin::And, p, ff);
+                        let q = self.s.m.bin(c, Bin::LShr, reference, bs);
+                        let q = self.s.m.bin(c, Bin::And, q, ff);
+                        let d = self.s.m.bin(c, Bin::Sub, p, q);
+                        let neg = self.s.m.cmp(c, pred::SLT, d, zero);
+                        let nd = self.s.m.bin(c, Bin::Sub, zero, d);
+                        let mut d = self.s.m.select(c, neg, nd, d);
+                        if masked {
+                            let none = self.s.m.cmp(c, pred::EQ, q, zero);
+                            d = self.s.m.select(c, none, zero, d);
+                        }
+                        sum = self.s.m.bin(c, Bin::Add, sum, d);
+                    }
+                    sums.push(sum);
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a quad SAD result");
+                };
+                let out: Vec<V> = if pk {
+                    let (m16, k16) = (k(self, 0xFFFF), k(self, 16));
+                    sums.chunks(2)
+                        .map(|p| {
+                            let lo = self.s.m.bin(c, Bin::And, p[0], m16);
+                            let hi = self.s.m.bin(c, Bin::Shl, p[1], k16);
+                            self.s.m.bin(c, Bin::Or, lo, hi)
+                        })
+                        .collect()
+                } else {
+                    sums
+                };
+                for (n, x) in out.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + n as u8), x, guard);
+                }
+                Ok(())
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
