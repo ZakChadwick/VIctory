@@ -5052,6 +5052,20 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // A 16 x 16-bit product (op_sel picks the halves) plus a dword.
+                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let d = s(self, 2)?;
+                if name == "v_mad_i32_i16" {
+                    let k16 = k(self, 16);
+                    let t = self.s.m.bin(c, Bin::Shl, a, k16);
+                    a = self.s.m.bin(c, Bin::AShr, t, k16);
+                    let t = self.s.m.bin(c, Bin::Shl, b, k16);
+                    b = self.s.m.bin(c, Bin::AShr, t, k16);
+                }
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);

@@ -937,3 +937,32 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_mad_u32_u16` and `v_mad_i32_i16` multiply the low halves of src0 and
+/// src1, zero- or sign-extended, and add the full dword src2.
+#[test]
+fn mad_32_16_multiplies_low_halves_and_adds_a_dword() {
+    let cases = [
+        [0xABCD_FFFF, 0x1234_FFFF, 0x0000_0001, 0],
+        [0x0000_8000, 0xFFFF_0002, 0x8000_0000, 0],
+        [0x0000_7FFF, 0x0000_7FFF, 0xFFFF_FFFF, 0],
+        [0x5555_0003, 0x0000_FFFD, 0x0000_0010, 0],
+    ];
+    for (name, op, signed) in [
+        ("v_mad_u32_u16", 0x373, false),
+        ("v_mad_i32_i16", 0x375, true),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let h = |w: u32| {
+                if signed {
+                    i32::from(w as u16 as i16) as u32
+                } else {
+                    u32::from(w as u16)
+                }
+            };
+            let want = h(inp[0]).wrapping_mul(h(inp[1])).wrapping_add(inp[2]);
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}
