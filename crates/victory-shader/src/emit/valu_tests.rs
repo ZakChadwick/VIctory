@@ -1130,3 +1130,73 @@ fn f64_ldexp_and_frexp() {
         });
     }
 }
+
+/// `v_rcp_f64` divides exactly; `v_sqrt_f64` and `v_rsq_f64` are within an
+/// ulp of the correctly rounded results (the hardware's are approximate),
+/// denormal inputs included, with the IEEE results for zeros, infinities,
+/// negative values and NaN.
+#[test]
+fn f64_rcp_sqrt_rsq() {
+    use std::collections::HashMap;
+    let b = f64::from_bits;
+    let values = [
+        1.0,
+        2.0,
+        3.0,
+        0.5,
+        10.0,
+        1e-300,
+        1e300,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        b(1),
+        b(0x000F_FFFF_FFFF_FFFF),
+        123_456_789.123,
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        -1.0,
+        f64::NAN,
+    ];
+    let cases: Vec<[u32; 4]> = values
+        .iter()
+        .map(|d| {
+            let b = d.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    type Model = fn(f64) -> f64;
+    // VOP1 v_rcp_f64 = 0x2F, v_rsq_f64 = 0x31, v_sqrt_f64 = 0x34.
+    let ops: [(&str, u16, Model, u64); 3] = [
+        ("v_rcp_f64", 0x2F, |d| 1.0 / d, 0),
+        ("v_sqrt_f64", 0x34, f64::sqrt, 1),
+        ("v_rsq_f64", 0x31, |d| 1.0 / d.sqrt(), 1),
+    ];
+    for (name, op, f, ulps) in ops {
+        let mut got: HashMap<(String, usize), u64> = HashMap::new();
+        for half in 0..2u32 {
+            let mut body = vec![vop1(op, 0, vgpr(1))];
+            if half == 1 {
+                body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+            }
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, i, _, w| {
+                *got.entry((backend.to_string(), i)).or_default() |= u64::from(w) << (32 * half);
+            });
+        }
+        for ((backend, i), bits) in got {
+            let (d, r, want) = (values[i], b(bits), f(values[i]));
+            if want.is_nan() {
+                assert!(r.is_nan(), "{backend}: {name}({d:e}) = {r:e}, want NaN");
+            } else if want.is_infinite() || want == 0.0 {
+                assert_eq!(bits, want.to_bits(), "{backend}: {name}({d:e}) = {r:e}");
+            } else {
+                let diff = bits.abs_diff(want.to_bits());
+                assert!(
+                    diff <= ulps,
+                    "{backend}: {name}({d:e}) = {r:e}, want {want:e}"
+                );
+            }
+        }
+    }
+}

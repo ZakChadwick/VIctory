@@ -1494,6 +1494,65 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, special, x, r)
     }
 
+    /// The square root of the f64 `x` (DXIL has no double one): x is m * 2^e
+    /// with e even and m in [0.5, 2); an estimate of sqrt(m) is refined
+    /// by Newton steps and a residual correction in f64, and scaled by
+    /// 2^(e/2) through its exponent bits. Negative values give NaN; zeros,
+    /// +inf and NaN give themselves.
+    fn sqrt64(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (f64t, i64t) = (self.s.m.double(), self.s.m.int(64));
+        let k = |l: &mut Self, n: i64| l.s.m.int_const(i64t, n);
+        let kf = |l: &mut Self, f: f64| {
+            let b = l.s.m.int_const(i64t, f.to_bits() as i64);
+            l.s.m.cast(c, Cast::Bitcast, b, f64t)
+        };
+        let (m, e, special) = self.frexp64(x);
+        // An odd exponent moves a factor 2 into m.
+        let one = k(self, 1);
+        let odd = self.s.m.bin(c, Bin::And, e, one);
+        let zero = k(self, 0);
+        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+        let two = kf(self, 2.0);
+        let m2 = self.s.m.bin(c, Bin::Mul, m, two);
+        let m = self.s.m.select(c, odd, m2, m);
+        let e1 = self.s.m.bin(c, Bin::Sub, e, one);
+        let e = self.s.m.select(c, odd, e1, e);
+        // sqrt(m) in [0.7, 1.42): from (1 + m) / 2 (within 6%, above),
+        // Newton's y = (y + m/y) / 2 squares the error: 4 steps reach 2^-80.
+        let half = kf(self, 0.5);
+        let one_f = kf(self, 1.0);
+        let t = self.s.m.bin(c, Bin::Add, m, one_f);
+        let mut y = self.s.m.bin(c, Bin::Mul, t, half);
+        for _ in 0..4 {
+            let q = self.s.m.bin(c, Bin::SDiv, m, y);
+            let t = self.s.m.bin(c, Bin::Add, y, q);
+            y = self.s.m.bin(c, Bin::Mul, t, half);
+        }
+        // y += (m - y * y) / (2 y), the residual from an exact fused product.
+        let nz = kf(self, -0.0);
+        let ny = self.s.m.bin(c, Bin::Sub, nz, y);
+        let r = self
+            .s
+            .op(c, "tertiary.f64", Attr::ReadNone, f64t, 47, &[ny, y, m]);
+        let y2 = self.s.m.bin(c, Bin::Mul, y, two);
+        let d = self.s.m.bin(c, Bin::SDiv, r, y2);
+        let y = self.s.m.bin(c, Bin::Add, y, d);
+        // Times 2^(e/2): y is in [0.5, 2), so its exponent field moves.
+        let k52 = k(self, 52);
+        let ybits = self.s.m.cast(c, Cast::Bitcast, y, i64t);
+        let h = self.s.m.bin(c, Bin::AShr, e, one);
+        let h = self.s.m.bin(c, Bin::Shl, h, k52);
+        let ybits = self.s.m.bin(c, Bin::Add, ybits, h);
+        let y = self.s.m.cast(c, Cast::Bitcast, ybits, f64t);
+        // Special inputs keep their value; a negative one (not -0) is NaN.
+        let y = self.s.m.select(c, special, x, y);
+        let z = kf(self, 0.0);
+        let neg = self.s.m.cmp(c, pred::OLT, x, z);
+        let nan = kf(self, f64::NAN);
+        self.s.m.select(c, neg, nan, y)
+    }
+
     /// [`Self::max_min`] for f64: DXIL's FMax/FMin, with -0 below +0.
     fn max_min64(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
@@ -3897,6 +3956,25 @@ impl<'a> Lower<'a> {
                 let a = self.fsrc64(inst, 0)?;
                 let n = s(self, 1)?;
                 let r = self.ldexp64(a, n);
+                self.write_f64(inst, r, guard)
+            }
+            "v_rcp_f64" | "v_sqrt_f64" | "v_rsq_f64" => {
+                // shortcut: the hardware's reciprocal and square roots are
+                // approximate; these are within an ulp.
+                let a = self.fsrc64(inst, 0)?;
+                self.s.flags |= flags::DOUBLE_EXTENSIONS;
+                let f64t = self.s.m.double();
+                let i64t = self.s.m.int(64);
+                let one = self.s.m.int_const(i64t, 1f64.to_bits() as i64);
+                let one = self.s.m.cast(c, Cast::Bitcast, one, f64t);
+                let r = match name {
+                    "v_rcp_f64" => self.s.m.bin(c, Bin::SDiv, one, a),
+                    "v_sqrt_f64" => self.sqrt64(a),
+                    _ => {
+                        let q = self.sqrt64(a);
+                        self.s.m.bin(c, Bin::SDiv, one, q)
+                    }
+                };
                 self.write_f64(inst, r, guard)
             }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
