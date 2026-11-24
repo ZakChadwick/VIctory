@@ -937,3 +937,56 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `s_add_i32`, `s_sub_i32` and `s_addk_i32` set SCC on signed overflow.
+#[test]
+fn signed_scalar_add_and_sub_set_scc_on_overflow() {
+    let cases = [
+        [0x7FFF_FFFF, 1, 0, 0],
+        [0x8000_0000, 0xFFFF_FFFF, 0, 0],
+        [0x8000_0000, 1, 0, 0],
+        [0x7FFF_FFFF, 0xFFFF_FFFF, 0, 0],
+        [5, 7, 0, 0],
+        [0xFFFF_FFFB, 0xFFFF_FFF9, 0, 0],
+        [0x4000_0000, 0x4000_0000, 0, 0],
+        [0xC000_0000, 0x4000_0001, 0, 0],
+    ];
+    // s_cselect_b32 s7, 1, 0 (SOP2 0x0A): SCC as a number.
+    let scc = sop2(0x0A, 7, 0x81, 0x80);
+    let add = |a: u32, b: u32| (a as i32).overflowing_add(b as i32);
+    let sub = |a: u32, b: u32| (a as i32).overflowing_sub(b as i32);
+    type Model = fn(u32, u32) -> (i32, bool);
+    let ops: [(&str, u8, Model); 2] = [("s_add_i32", 0x02, add), ("s_sub_i32", 0x03, sub)];
+    for (name, op, f) in ops {
+        for (what, read) in [("result", 6), ("SCC", 7)] {
+            let body = [sop2(op, 6, 0, 1), scc, vop1(0x001, 0, sgpr(read))];
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let (r, o) = f(inp[0], inp[1]);
+                let want = if read == 6 { r as u32 } else { u32::from(o) };
+                assert_eq!(got, want, "{backend}: {name} {what} {inp:x?}");
+            });
+        }
+    }
+    // SOPK s_addk_i32 s6, imm (0x0F) after s_mov_b32 s6, s0.
+    for imm in [0x7FFFu16, 0x8000, 1, 0xFFFF] {
+        let k = i32::from(imm as i16) as u32;
+        for read in [6, 7] {
+            let body = [
+                s_mov_b32(6, 0),
+                0xB000_0000 | 0x0F << 23 | 6 << 16 | u32::from(imm),
+                scc,
+                vop1(0x001, 0, sgpr(read)),
+            ];
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let (r, o) = add(inp[0], k);
+                let want = if read == 6 { r as u32 } else { u32::from(o) };
+                assert_eq!(
+                    got, want,
+                    "{backend}: s_addk_i32 {imm:#x} {inp:x?} reads s{read}"
+                );
+            });
+        }
+    }
+}
