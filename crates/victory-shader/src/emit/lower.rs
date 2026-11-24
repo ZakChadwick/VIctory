@@ -4460,7 +4460,10 @@ impl<'a> Lower<'a> {
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
-            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
+            && !matches!(
+                name,
+                "v_cvt_f16_f32" | "v_cvt_f32_f16" | "v_frexp_mant_f16" | "v_frexp_exp_i16_f16"
+            )
         {
             return None;
         }
@@ -4501,6 +4504,60 @@ impl<'a> Lower<'a> {
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
             return float_result(self, f);
+        }
+        if matches!(name, "v_frexp_mant_f16" | "v_frexp_exp_i16_f16") {
+            // Worked on the f16 bits: the mantissa in [0.5, 1) with the sign,
+            // or the exponent. Zero, infinities and NaN keep their bits and
+            // have exponent 0.
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on v_frexp_*_f16");
+            }
+            let mut h = self.half_src(inst, 0)?;
+            let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+            if v.abs & 1 != 0 {
+                let m = k(self, 0x7FFF);
+                h = self.s.m.bin(c, Bin::And, h, m);
+            }
+            if v.neg & 1 != 0 {
+                let m = k(self, 0x8000);
+                h = self.s.m.bin(c, Bin::Xor, h, m);
+            }
+            let (k10, k1f, low) = (k(self, 10), k(self, 0x1F), k(self, 0x3FF));
+            let sign = k(self, 0x8000);
+            let sign = self.s.m.bin(c, Bin::And, h, sign);
+            let e = self.s.m.bin(c, Bin::LShr, h, k10);
+            let e = self.s.m.bin(c, Bin::And, e, k1f);
+            let frac = self.s.m.bin(c, Bin::And, h, low);
+            // A denormal is frac * 2^-24: frac converts to f32 exactly, and
+            // its exponent field fe gives 0.1... * 2^(fe - 150).
+            let df = self.s.m.cast(c, Cast::UiToFp, frac, f32t);
+            let db = self.as_int(df);
+            let (k23, ff, k13) = (k(self, 23), k(self, 0xFF), k(self, 13));
+            let de = self.s.m.bin(c, Bin::LShr, db, k23);
+            let de = self.s.m.bin(c, Bin::And, de, ff);
+            let dfrac = self.s.m.bin(c, Bin::LShr, db, k13);
+            let dfrac = self.s.m.bin(c, Bin::And, dfrac, low);
+            let zero = k(self, 0);
+            let denorm = self.s.m.cmp(c, pred::EQ, e, zero);
+            let (bias, dbias) = (k(self, 14), k(self, 150));
+            let ne = self.s.m.bin(c, Bin::Sub, e, bias);
+            let de = self.s.m.bin(c, Bin::Sub, de, dbias);
+            let exp = self.s.m.select(c, denorm, de, ne);
+            let frac = self.s.m.select(c, denorm, dfrac, frac);
+            let half = k(self, 0x3800);
+            let mant = self.s.m.bin(c, Bin::Or, frac, half);
+            let mant = self.s.m.bin(c, Bin::Or, mant, sign);
+            let mag = k(self, 0x7FFF);
+            let mag = self.s.m.bin(c, Bin::And, h, mag);
+            let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
+            let is_special = self.s.m.cmp(c, pred::EQ, e, k1f);
+            let keep = self.s.m.bin(c, Bin::Or, is_zero, is_special);
+            let r = if name == "v_frexp_mant_f16" {
+                self.s.m.select(c, keep, h, mant)
+            } else {
+                self.s.m.select(c, keep, zero, exp)
+            };
+            return self.write_half(inst, r, guard);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);

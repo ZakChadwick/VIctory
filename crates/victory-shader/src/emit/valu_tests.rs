@@ -937,3 +937,45 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_frexp_mant_f16` and `v_frexp_exp_i16_f16` split an f16 into a mantissa
+/// in [0.5, 1) with its sign and an exponent, denormals included; zero,
+/// infinities and NaN keep their bits and have exponent 0.
+#[test]
+fn frexp_f16_splits_mantissa_and_exponent() {
+    let halves: [u16; 12] = [
+        0x3C00, // 1.0
+        0xC300, // -3.5
+        0x2E66, // ~0.1
+        0x7BFF, // max
+        0x0400, // smallest normal
+        0x0001, // smallest denormal
+        0x83FF, // -largest denormal
+        0x0000, 0x8000, 0x7C00, 0xFC00, 0x7E00,
+    ];
+    // High halves are junk: only the low half is read.
+    let cases: Vec<[u32; 4]> = halves
+        .iter()
+        .map(|&h| [0xABCD_0000 | u32::from(h), 0, 0, 0])
+        .collect();
+    let frexp = |h: u16| -> (u16, i16) {
+        let x = f64::from(f16_to_f32(h));
+        if x == 0.0 || !x.is_finite() {
+            return (h, 0);
+        }
+        let e = x.abs().log2().floor() as i32 + 1;
+        let m = x / 2f64.powi(e);
+        // m is in [0.5, 1): exponent field 14, 10 mantissa bits.
+        let bits = (m.abs() * 2048.0) as u16 - 1024;
+        (u16::from(m < 0.0) << 15 | 14 << 10 | bits, e as i16)
+    };
+    // VOP1 v_frexp_mant_f16 = 0x59, v_frexp_exp_i16_f16 = 0x5A.
+    for (name, op) in [("v_frexp_mant_f16", 0x59), ("v_frexp_exp_i16_f16", 0x5A)] {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let (m, e) = frexp(inp[0] as u16);
+            let want = if op == 0x59 { m } else { e as u16 };
+            assert_eq!(got as u16, want, "{backend}: {name} {:#06x}", inp[0] as u16);
+        });
+    }
+}
