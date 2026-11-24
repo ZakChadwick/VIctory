@@ -937,3 +937,33 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_mul_hi_u32_u24` and `v_mul_hi_i32_i24` return bits 32..47 of the
+/// product of the low 24 bits of each operand, zero- or sign-filled.
+#[test]
+fn mul_hi_24_returns_high_bits_of_48_bit_product() {
+    let cases = [
+        [0x00FF_FFFF, 0x00FF_FFFF, 0, 0],
+        [0xFF80_0000, 0x0080_0000, 0, 0],
+        [0x0012_3456, 0xAB65_4321, 0, 0],
+        [0x0000_0001, 0xFFFF_FFFF, 0, 0],
+        [0x0080_0000, 0x0080_0000, 0, 0],
+    ];
+    let sext = |x: u32| i64::from(((x << 8) as i32) >> 8);
+    let zext = |x: u32| u64::from(x & 0x00FF_FFFF);
+    // VOP2 v_mul_hi_i32_i24 = 0x0A, v_mul_hi_u32_u24 = 0x0C (VOP3 0x100 + op).
+    for (name, op, signed) in [
+        ("v_mul_hi_i32_i24", 0x10A, true),
+        ("v_mul_hi_u32_u24", 0x10C, false),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = if signed {
+                ((sext(inp[0]) * sext(inp[1])) >> 32) as u32
+            } else {
+                ((zext(inp[0]) * zext(inp[1])) >> 32) as u32
+            };
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}

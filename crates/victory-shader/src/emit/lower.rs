@@ -4958,21 +4958,20 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            "v_mul_u32_u24" | "v_mul_i32_i24" => {
+            "v_mul_u32_u24" | "v_mul_i32_i24" | "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mul_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
+                let signed = name.contains("_i32_i24");
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
                 let a = self.s.m.bin(c, Bin::Shl, a, sh);
                 let a = self.s.m.bin(c, op, a, sh);
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
-                self.s.m.bin(c, Bin::Mul, a, b)
+                if name.starts_with("v_mul_hi") {
+                    // Bits 32..47 of the 48-bit product, sign- or zero-filled.
+                    self.mul_hi(a, b, signed)
+                } else {
+                    self.s.m.bin(c, Bin::Mul, a, b)
+                }
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
