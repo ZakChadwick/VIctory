@@ -64,6 +64,49 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// The first 1201 bits of the fraction of 2/pi, most significant first, as
+/// `v_trig_preop_f64` reads them.
+const TWO_BY_PI: [u32; 38] = [
+    0xA2F9_836E,
+    0x4E44_1529,
+    0xFC27_57D1,
+    0xF534_DDC0,
+    0xDB62_9599,
+    0x3C43_9041,
+    0xFE51_63AB,
+    0xDEBB_C561,
+    0xB724_6E3A,
+    0x424D_D2E0,
+    0x0649_2EEA,
+    0x09D1_921C,
+    0xFE1D_EB1C,
+    0xB129_A73E,
+    0xE882_35F5,
+    0x2EBB_4484,
+    0xE99C_7026,
+    0xB45F_7E41,
+    0x3991_D639,
+    0x8353_39F4,
+    0x9C84_5F8B,
+    0xBDF9_283B,
+    0x1FF8_97FF,
+    0xDE05_980F,
+    0xEF2F_118B,
+    0x5A0A_6D1F,
+    0x6D36_7ECF,
+    0x27CB_09B7,
+    0x4F46_3F66,
+    0x9E5F_EA2D,
+    0x7527_BAC7,
+    0xEBE5_F17B,
+    0x3D07_39F7,
+    0x8A52_92EA,
+    0x6BFB_5FB1,
+    0x1F8D_5D08,
+    0x5603_3046,
+    0xFC7B_0000,
+];
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -217,6 +260,8 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The table of [`TWO_BY_PI`], once made.
+    two_by_pi: Option<V>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -513,6 +558,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            two_by_pi: None,
             counters: HashMap::new(),
             abort: None,
         }
@@ -1441,6 +1487,78 @@ impl<'a> Lower<'a> {
         let is_special = self.s.m.cmp(c, pred::EQ, raw, k7ff);
         let special = self.s.m.bin(c, Bin::Or, is_zero, is_special);
         (m, exp, special)
+    }
+
+    /// `v_trig_preop_f64`: the 53 bits of 2/pi from bit `shift` = 53 *
+    /// seg[4:0] (plus how far x's exponent field passes 1077), as an f64 at
+    /// 2^(-53 - shift), times 2^128 when the field is 1968 or more.
+    fn trig_preop(&mut self, x: V, seg: V) -> V {
+        let c = self.cur;
+        let (f64t, i64t, i32t) = (self.s.m.double(), self.s.m.int(64), self.s.t.i32);
+        self.s.flags |= flags::DOUBLE_EXTENSIONS;
+        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+        let bits = self.s.m.cast(c, Cast::Bitcast, x, i64t);
+        let k52 = self.s.m.int_const(i64t, 52);
+        let e = self.s.m.bin(c, Bin::LShr, bits, k52);
+        let e = self.s.m.cast(c, Cast::Trunc, e, i32t);
+        let k7ff = k(self, 0x7FF);
+        let e = self.s.m.bin(c, Bin::And, e, k7ff);
+        let (k31, k53, k1077) = (k(self, 31), k(self, 53), k(self, 1077));
+        let seg = self.s.m.bin(c, Bin::And, seg, k31);
+        let shift = self.s.m.bin(c, Bin::Mul, seg, k53);
+        let past = self.s.m.cmp(c, pred::IUGT, e, k1077);
+        let extra = self.s.m.bin(c, Bin::Sub, e, k1077);
+        let zero = k(self, 0);
+        let extra = self.s.m.select(c, past, extra, zero);
+        let shift = self.s.m.bin(c, Bin::Add, shift, extra);
+        // The dwords of 2/pi holding bits shift..shift+53 (zero past bit 1201).
+        let g = match self.two_by_pi {
+            Some(g) => g,
+            None => {
+                let mut elems: Vec<V> = TWO_BY_PI.iter().map(|&w| self.s.m.i32(w)).collect();
+                // Room for the largest shift: 31 * 53 + 2046 - 1077, plus two.
+                elems.resize(84, self.s.m.i32(0));
+                let arr = self.s.m.array(84, i32t);
+                let init = self.s.m.aggregate(arr, &elems);
+                let g = self.s.m.constant_global("two_by_pi", init);
+                self.two_by_pi = Some(g);
+                g
+            }
+        };
+        let five = k(self, 5);
+        let idx = self.s.m.bin(c, Bin::LShr, shift, five);
+        let mut w = Vec::new();
+        for n in 0..3 {
+            let i = k(self, n);
+            let i = self.s.m.bin(c, Bin::Add, idx, i);
+            let at = self.s.m.element(c, g, i);
+            let x = self.s.m.load(c, at);
+            w.push(self.s.m.cast(c, Cast::ZExt, x, i64t));
+        }
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, w[0], k32);
+        let hi = self.s.m.bin(c, Bin::Or, hi, w[1]);
+        let lo = self.s.m.bin(c, Bin::Shl, w[2], k32);
+        let b = self.s.m.bin(c, Bin::And, shift, k31);
+        let b64 = self.s.m.cast(c, Cast::ZExt, b, i64t);
+        let k64 = self.s.m.int_const(i64t, 64);
+        let up = self.s.m.bin(c, Bin::Shl, hi, b64);
+        let back = self.s.m.bin(c, Bin::Sub, k64, b64);
+        let down = self.s.m.bin(c, Bin::LShr, lo, back);
+        let joined = self.s.m.bin(c, Bin::Or, up, down);
+        let aligned = self.s.m.cmp(c, pred::EQ, b, zero);
+        let t = self.s.m.select(c, aligned, hi, joined);
+        let k11 = self.s.m.int_const(i64t, 11);
+        let m = self.s.m.bin(c, Bin::LShr, t, k11);
+        let m = self.s.m.cast(c, Cast::UiToFp, m, f64t);
+        let base = k(self, -53i32 as u32);
+        let scale = self.s.m.bin(c, Bin::Sub, base, shift);
+        let k1968 = k(self, 1968);
+        let huge = self.s.m.cmp(c, pred::IUGE, e, k1968);
+        let k128 = k(self, 128);
+        let up = self.s.m.bin(c, Bin::Add, scale, k128);
+        let scale = self.s.m.select(c, huge, up, scale);
+        self.ldexp64(m, scale)
     }
 
     /// `x * 2^n` (`n` an i32), rounded once: with x's mantissa m in
@@ -3892,6 +4010,12 @@ impl<'a> Lower<'a> {
                     let r = self.s.m.select(c, special, z, e);
                     int(self, r)
                 }
+            }
+            "v_trig_preop_f64" => {
+                let a = self.fsrc64(inst, 0)?;
+                let seg = s(self, 1)?;
+                let r = self.trig_preop(a, seg);
+                self.write_f64(inst, r, guard)
             }
             "v_ldexp_f64" => {
                 let a = self.fsrc64(inst, 0)?;

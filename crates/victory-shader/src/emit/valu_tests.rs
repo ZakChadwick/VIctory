@@ -1130,3 +1130,156 @@ fn f64_ldexp_and_frexp() {
         });
     }
 }
+
+/// The first `n` bits of the fraction of 2/pi, most significant first,
+/// computed with Machin's formula on fixed-point big integers (32-bit limbs,
+/// least significant first) and a binary long division.
+fn two_by_pi_bits(n: usize) -> Vec<bool> {
+    const W: usize = 1408; // fraction bits; 2/pi needs n < W - 64
+    const L: usize = 2 * W / 32 + 2;
+    type Big = Vec<u32>;
+    let zero = || vec![0u32; L];
+    let div_small = |a: &mut Big, d: u32| {
+        let mut rem = 0u64;
+        for x in a.iter_mut().rev() {
+            let cur = rem << 32 | u64::from(*x);
+            *x = (cur / u64::from(d)) as u32;
+            rem = cur % u64::from(d);
+        }
+    };
+    let mul_small = |a: &mut Big, m: u32| {
+        let mut carry = 0u64;
+        for x in a.iter_mut() {
+            let cur = u64::from(*x) * u64::from(m) + carry;
+            *x = cur as u32;
+            carry = cur >> 32;
+        }
+    };
+    let add = |a: &mut Big, b: &Big| {
+        let mut carry = 0u64;
+        for (x, y) in a.iter_mut().zip(b) {
+            let cur = u64::from(*x) + u64::from(*y) + carry;
+            *x = cur as u32;
+            carry = cur >> 32;
+        }
+    };
+    let sub = |a: &mut Big, b: &Big| {
+        let mut borrow = 0i64;
+        for (x, y) in a.iter_mut().zip(b) {
+            let cur = i64::from(*x) - i64::from(*y) - borrow;
+            *x = cur as u32;
+            borrow = i64::from(cur < 0);
+        }
+    };
+    let ge = |a: &Big, b: &Big| {
+        for (x, y) in a.iter().zip(b).rev() {
+            if x != y {
+                return x > y;
+            }
+        }
+        true
+    };
+    // arctan(1/k) * 2^W
+    let arctan_inv = |k: u32| -> Big {
+        let mut sum = zero();
+        let mut neg = zero();
+        let mut t = zero();
+        t[W / 32] = 1;
+        div_small(&mut t, k);
+        let mut term = 1u32;
+        loop {
+            if t.iter().all(|&x| x == 0) {
+                break;
+            }
+            let mut q = t.clone();
+            div_small(&mut q, term);
+            if term % 4 == 1 {
+                add(&mut sum, &q)
+            } else {
+                add(&mut neg, &q)
+            }
+            div_small(&mut t, k * k);
+            term += 2;
+        }
+        sub(&mut sum, &neg);
+        sum
+    };
+    let mut pi = arctan_inv(5);
+    mul_small(&mut pi, 16);
+    let mut b = arctan_inv(239);
+    mul_small(&mut b, 4);
+    sub(&mut pi, &b);
+    // q = 2^(2W+1) / pi = (2/pi) * 2^W, by bits.
+    let mut r = zero();
+    let mut q = vec![false; W];
+    for bit in (0..=2 * W + 1).rev() {
+        // r = 2r + (bit == 2W+1)
+        let mut carry = u32::from(bit == 2 * W + 1);
+        for x in r.iter_mut() {
+            let next = *x >> 31;
+            *x = *x << 1 | carry;
+            carry = next;
+        }
+        if ge(&r, &pi) {
+            sub(&mut r, &pi);
+            if bit < W {
+                q[W - 1 - bit] = true;
+            }
+        }
+    }
+    q.truncate(n);
+    q
+}
+
+/// `v_trig_preop_f64` returns the 53 bits of 2/pi from bit 53 * seg (plus
+/// how far the exponent field passes 1077), at 2^(-53 - shift), times
+/// 2^128 for an exponent field of 1968 or more; bits past 1201 are 0.
+#[test]
+fn v_trig_preop_f64_returns_segments_of_two_by_pi() {
+    let bits = two_by_pi_bits(1201);
+    let pow2 = |n: i32| f64::from_bits(((n + 1023) as u64) << 52);
+    let model = |field: u32, seg: u32| -> f64 {
+        let shift = 53 * (seg & 31) as usize + field.saturating_sub(1077) as usize;
+        let m = (0..53).fold(0u64, |m, i| {
+            m << 1 | u64::from(bits.get(shift + i).copied().unwrap_or(false))
+        });
+        let scale = -53 - shift as i32 + if field >= 1968 { 128 } else { 0 };
+        // m * 2^scale, in exact steps of at most 2^-1000.
+        let (mut v, mut s) = (m as f64, scale);
+        while s < -1000 {
+            v *= pow2(-1000);
+            s += 1000;
+        }
+        v * pow2(s)
+    };
+    let mut cases = Vec::new();
+    for field in [1023u32, 1077, 1078, 1100, 1500, 1967, 1968, 2000] {
+        for seg in [0u32, 1, 2, 3, 5, 0x21] {
+            let x = f64::from_bits(u64::from(field) << 52 | 0x0001_2345_6789);
+            let b = x.to_bits();
+            cases.push([b as u32, (b >> 32) as u32, seg, 0]);
+        }
+    }
+    for half in 0..2 {
+        // VOP3 v_trig_preop_f64 v[0:1], v[1:2], v3 (0x174).
+        let mut body = vop3(0x174, 0, vgpr(1), vgpr(3), 0).to_vec();
+        if half == 1 {
+            body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+        }
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let field = inp[1] >> 20 & 0x7FF;
+            let want = (model(field, inp[2]).to_bits() >> (32 * half)) as u32;
+            assert_eq!(
+                got, want,
+                "{backend}: field {field}, segment {} dword {half}",
+                inp[2]
+            );
+        });
+    }
+    // The first segment is 2/pi rounded toward zero.
+    assert_eq!(
+        model(1023, 0),
+        f64::from_bits(std::f64::consts::FRAC_2_PI.to_bits() - 1)
+    );
+}
