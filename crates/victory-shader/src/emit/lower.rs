@@ -5168,6 +5168,30 @@ impl<'a> Lower<'a> {
                 }
                 r
             }
+            "v_dot4c_i32_i8" => {
+                // The four signed byte products of src0 and src1 summed into
+                // the destination, wrapping.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("an accumulator");
+                };
+                let mut r = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let k24 = k(self, 24);
+                for i in 0..4 {
+                    let up = k(self, 24 - 8 * i);
+                    let byte = |l: &mut Self, x| {
+                        let t = l.s.m.bin(c, Bin::Shl, x, up);
+                        l.s.m.bin(c, Bin::AShr, t, k24)
+                    };
+                    let (x, y) = (byte(self, a), byte(self, b));
+                    let p = self.s.m.bin(c, Bin::Mul, x, y);
+                    r = self.s.m.bin(c, Bin::Add, r, p);
+                }
+                r
+            }
             "v_bfm_b32" => {
                 // ((1 << src0[4:0]) - 1) << src1[4:0]
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

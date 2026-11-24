@@ -937,3 +937,29 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_dot4c_i32_i8` sums the four signed byte products of src0 and src1 into
+/// its destination, wrapping.
+#[test]
+fn dot4c_i32_i8_accumulates_into_its_destination() {
+    let cases = [
+        [0x0102_0304, 0x0506_0708, 0x0000_0010, 0],
+        [0x8080_8080, 0x8080_8080, 0x0000_0000, 0],
+        [0x7F80_FF01, 0x80FF_7F01, 0xFFFF_FFFF, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0x7FFF_FFFF, 0],
+    ];
+    let body = [
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3 (the accumulator)
+        // VOP2 v_dot4c_i32_i8 v0, v1, v2 (opcode 0x0D)
+        0x0D << 25 | 2 << 9 | u32::from(vgpr(1)),
+    ];
+    let shader = build_valu_cs(&body);
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        let mut want = inp[2];
+        for i in 0..4 {
+            let byte = |w: u32| i32::from((w >> (8 * i)) as u8 as i8);
+            want = want.wrapping_add((byte(inp[0]) * byte(inp[1])) as u32);
+        }
+        assert_eq!(got, want, "{backend}: v_dot4c_i32_i8 {inp:x?}");
+    });
+}
