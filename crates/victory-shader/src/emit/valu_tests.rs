@@ -937,3 +937,45 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_frexp_mant_f32` and `v_frexp_exp_i32_f32` split a float into a mantissa
+/// in [0.5, 1) with its sign and an exponent, denormals included; zero,
+/// infinities and NaN keep their bits and have exponent 0.
+#[test]
+fn frexp_f32_splits_mantissa_and_exponent() {
+    let f = f32::to_bits;
+    let cases = [
+        [f(1.0), 0, 0, 0],
+        [f(-3.5), 0, 0, 0],
+        [f(0.1), 0, 0, 0],
+        [f(f32::MAX), 0, 0, 0],
+        [f(f32::MIN_POSITIVE), 0, 0, 0],
+        [0x0000_0001, 0, 0, 0], // smallest denormal
+        [0x8040_0000, 0, 0, 0], // -denormal
+        [0x0000_0000, 0, 0, 0],
+        [0x8000_0000, 0, 0, 0],
+        [f(f32::INFINITY), 0, 0, 0],
+        [f(f32::NEG_INFINITY), 0, 0, 0],
+        [0x7FC0_0000, 0, 0, 0],
+    ];
+    // Reference in f64, where every f32 (denormals too) is normal.
+    let frexp = |bits: u32| -> (u32, i32) {
+        let x = f32::from_bits(bits);
+        if x == 0.0 || !x.is_finite() {
+            return (bits, 0);
+        }
+        let d = f64::from(x).to_bits();
+        let e = ((d >> 52) & 0x7FF) as i32 - 1022;
+        let m = f64::from_bits(d & !(0x7FF << 52) | 1022 << 52) as f32;
+        (m.to_bits(), e)
+    };
+    // VOP1 v_frexp_exp_i32_f32 = 0x3F, v_frexp_mant_f32 = 0x40.
+    for (name, op) in [("v_frexp_exp_i32_f32", 0x3F), ("v_frexp_mant_f32", 0x40)] {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let (m, e) = frexp(inp[0]);
+            let want = if op == 0x40 { m } else { e as u32 };
+            assert_eq!(got, want, "{backend}: {name} {:#010x}", inp[0]);
+        });
+    }
+}

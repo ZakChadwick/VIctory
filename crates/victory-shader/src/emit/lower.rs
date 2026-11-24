@@ -1262,6 +1262,59 @@ impl<'a> Lower<'a> {
         self.s.m.cast(self.cur, Cast::Bitcast, f, self.s.t.i32)
     }
 
+    /// `frexp` of f32 source 0 (with its abs/neg modifiers), worked on the
+    /// bits so denormal inputs are not flushed: the bits of the mantissa in
+    /// [0.5, 1) with the sign, and the exponent. Zero, infinities and NaN
+    /// keep their bits and have exponent 0.
+    fn frexp_f32(&mut self, inst: &Inst) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let mut x = self.src(inst, 0)?;
+        let c = self.cur;
+        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+        if v.abs & 1 != 0 {
+            let m = k(self, 0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg & 1 != 0 {
+            let m = k(self, 0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        let (k23, ff, low) = (k(self, 23), k(self, 0xFF), k(self, 0x007F_FFFF));
+        let sign = k(self, 0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, x, sign);
+        let e = self.s.m.bin(c, Bin::LShr, x, k23);
+        let e = self.s.m.bin(c, Bin::And, e, ff);
+        let frac = self.s.m.bin(c, Bin::And, x, low);
+        // A denormal is frac * 2^-149: frac converts to f32 exactly, and its
+        // exponent field fe gives frac = 0.1... * 2^(fe - 126).
+        let df = self.s.m.cast(c, Cast::UiToFp, frac, self.s.t.f32);
+        let db = self.as_int(df);
+        let de = self.s.m.bin(c, Bin::LShr, db, k23);
+        let de = self.s.m.bin(c, Bin::And, de, ff);
+        let zero = k(self, 0);
+        let denorm = self.s.m.cmp(c, pred::EQ, e, zero);
+        let (bias, dbias) = (k(self, 126), k(self, 275));
+        let ne = self.s.m.bin(c, Bin::Sub, e, bias);
+        let de = self.s.m.bin(c, Bin::Sub, de, dbias);
+        let exp = self.s.m.select(c, denorm, de, ne);
+        let bits = self.s.m.select(c, denorm, db, x);
+        let bits = self.s.m.bin(c, Bin::And, bits, low);
+        let half = k(self, 0x3F00_0000);
+        let mant = self.s.m.bin(c, Bin::Or, bits, half);
+        let mant = self.s.m.bin(c, Bin::Or, mant, sign);
+        // Zero, infinity and NaN: the input and exponent 0.
+        let mag = k(self, 0x7FFF_FFFF);
+        let mag = self.s.m.bin(c, Bin::And, x, mag);
+        let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
+        let is_special = self.s.m.cmp(c, pred::EQ, e, ff);
+        let keep = self.s.m.bin(c, Bin::Or, is_zero, is_special);
+        let mant = self.s.m.select(c, keep, x, mant);
+        let exp = self.s.m.select(c, keep, zero, exp);
+        Ok((mant, exp))
+    }
+
     /// The SDWA operand selection of source `k`: a byte or word of the
     /// dword, zero- or sign-extended (none: the whole dword).
     fn sdwa_src(inst: &Inst, k: usize) -> Option<(u8, bool)> {
@@ -4003,6 +4056,15 @@ impl<'a> Lower<'a> {
                     _ => self.unary(op, a),
                 };
                 float(self, r)
+            }
+            "v_frexp_mant_f32" | "v_frexp_exp_i32_f32" => {
+                let (m, e) = self.frexp_f32(inst)?;
+                if name == "v_frexp_mant_f32" {
+                    let m = self.as_float(m);
+                    float(self, m)
+                } else {
+                    int(self, e)
+                }
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
