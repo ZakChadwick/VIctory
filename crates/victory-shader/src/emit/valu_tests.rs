@@ -937,3 +937,81 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// f64 add, multiply, fused multiply-add, minimum and maximum on VGPR pairs,
+/// with abs/neg source modifiers, a float inline constant (an f64 here) and
+/// -0 ordered below +0.
+#[test]
+fn f64_arithmetic_matches_ieee() {
+    let pairs = |a: f64, b: f64| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    };
+    let cases = [
+        pairs(1.0, 2.0),
+        pairs(0.1, 0.2),
+        pairs(-3.5, 1e300),
+        pairs(1e-310, -2.5e-310), // denormals
+        pairs(0.0, -0.0),
+        pairs(-0.0, 0.0),
+        pairs(f64::INFINITY, 1.0),
+        pairs(1.0 + f64::EPSILON, 1.0 - f64::EPSILON),
+    ];
+    // VOP3 word 0: abs in bits 8-10; word 1: neg in bits 29-31.
+    let with = |mut w: [u32; 2], abs: u32, neg: u32| {
+        w[0] |= abs << 8;
+        w[1] |= neg << 29;
+        w
+    };
+    type Model = fn(f64, f64) -> f64;
+    let ops: [(&str, [u32; 2], Model); 6] = [
+        ("v_add_f64", vop3(0x164, 0, vgpr(1), vgpr(3), 0), |a, b| {
+            a + b
+        }),
+        (
+            "v_add_f64 -src1",
+            with(vop3(0x164, 0, vgpr(1), vgpr(3), 0), 0, 2),
+            |a, b| a - b,
+        ),
+        (
+            "v_mul_f64 |src0|",
+            with(vop3(0x165, 0, vgpr(1), vgpr(3), 0), 1, 0),
+            |a, b| a.abs() * b,
+        ),
+        // src2 = -1.0 (inline constant 243): fused, (1 + e)(1 - e) - 1 is -e^2, not 0.
+        (
+            "v_fma_f64",
+            vop3(0x14C, 0, vgpr(1), vgpr(3), 243),
+            |a, b| a.mul_add(b, -1.0),
+        ),
+        ("v_min_f64", vop3(0x166, 0, vgpr(1), vgpr(3), 0), |a, b| {
+            if a == 0.0 && b == 0.0 {
+                f64::from_bits(a.to_bits() | b.to_bits())
+            } else {
+                a.min(b)
+            }
+        }),
+        ("v_max_f64", vop3(0x167, 0, vgpr(1), vgpr(3), 0), |a, b| {
+            if a == 0.0 && b == 0.0 {
+                f64::from_bits(a.to_bits() & b.to_bits())
+            } else {
+                a.max(b)
+            }
+        }),
+    ];
+    for (name, inst, f) in ops {
+        for half in 0..2 {
+            let mut body = inst.to_vec();
+            if half == 1 {
+                body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+            }
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let a = f64::from_bits(u64::from(inp[1]) << 32 | u64::from(inp[0]));
+                let b = f64::from_bits(u64::from(inp[3]) << 32 | u64::from(inp[2]));
+                let want = (f(a, b).to_bits() >> (32 * half)) as u32;
+                assert_eq!(got, want, "{backend}: {name} ({a:e}, {b:e}) dword {half}");
+            });
+        }
+    }
+}

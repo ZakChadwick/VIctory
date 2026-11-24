@@ -1400,6 +1400,32 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, zeros, signed, r)
     }
 
+    /// [`Self::max_min`] for f64: DXIL's FMax/FMin, with -0 below +0.
+    fn max_min64(&mut self, max: bool, a: V, b: V) -> V {
+        let c = self.cur;
+        let (f64t, i64t) = (self.s.m.double(), self.s.m.int(64));
+        let r = self.s.op(
+            c,
+            "binary.f64",
+            Attr::ReadNone,
+            f64t,
+            if max { 35 } else { 36 },
+            &[a, b],
+        );
+        let ia = self.s.m.cast(c, Cast::Bitcast, a, i64t);
+        let ib = self.s.m.cast(c, Cast::Bitcast, b, i64t);
+        let either = self.s.m.bin(c, Bin::Or, ia, ib);
+        let magnitude = self.s.m.int_const(i64t, i64::MAX);
+        let either = self.s.m.bin(c, Bin::And, either, magnitude);
+        let zero = self.s.m.int_const(i64t, 0);
+        let zeros = self.s.m.cmp(c, pred::EQ, either, zero);
+        // Of two zeros, +0 unless both are -0 (max), -0 unless neither (min).
+        let op = if max { Bin::And } else { Bin::Or };
+        let sign = self.s.m.bin(c, op, ia, ib);
+        let signed = self.s.m.cast(c, Cast::Bitcast, sign, f64t);
+        self.s.m.select(c, zeros, signed, r)
+    }
+
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
         self.s.op(
             self.cur,
@@ -3744,6 +3770,22 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_add_f64" | "v_mul_f64" | "v_fma_f64" | "v_max_f64" | "v_min_f64" => {
+                let (a, b) = (self.fsrc64(inst, 0)?, self.fsrc64(inst, 1)?);
+                let f64t = self.s.m.double();
+                let r = match name {
+                    "v_add_f64" => self.s.m.bin(c, Bin::Add, a, b),
+                    "v_mul_f64" => self.s.m.bin(c, Bin::Mul, a, b),
+                    "v_fma_f64" => {
+                        let d = self.fsrc64(inst, 2)?;
+                        self.s.flags |= flags::DOUBLE_EXTENSIONS;
+                        self.s
+                            .op(c, "tertiary.f64", Attr::ReadNone, f64t, 47, &[a, b, d])
+                    }
+                    _ => self.max_min64(name == "v_max_f64", a, b),
+                };
+                self.write_f64(inst, r, guard)
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -4268,10 +4310,16 @@ impl<'a> Lower<'a> {
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        self.pair64(inst, op)
+    }
+
+    /// A 64-bit operand's bits (a register pair; inline constants
+    /// sign-extend, literals and the null register zero-extend).
+    fn pair64(&mut self, inst: &Inst, op: Operand) -> Result<V, Why> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
@@ -4296,6 +4344,77 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// An f64 source with its abs/neg modifiers. Float inline constants are
+    /// f64 values here, and a literal is the high dword.
+    fn fsrc64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match op {
+            Operand::Const(n @ 240..=248) => {
+                let f: f64 = match n {
+                    240 => 0.5,
+                    241 => -0.5,
+                    242 => 1.0,
+                    243 => -1.0,
+                    244 => 2.0,
+                    245 => -2.0,
+                    246 => 4.0,
+                    247 => -4.0,
+                    _ => f64::from_bits(0x3FC4_5F30_6DC9_C882),
+                };
+                self.s.flags |= flags::INT64;
+                self.s.m.int_const(i64t, f.to_bits() as i64)
+            }
+            Operand::Literal(lit) => {
+                self.s.flags |= flags::INT64;
+                self.s.m.int_const(i64t, (u64::from(lit) << 32) as i64)
+            }
+            _ => self.pair64(inst, op)?,
+        };
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.int_const(i64t, i64::MAX);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.int_const(i64t, i64::MIN);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        self.s.flags |= flags::DOUBLES;
+        let f64t = self.s.m.double();
+        Ok(self.s.m.cast(c, Cast::Bitcast, x, f64t))
+    }
+
+    /// Writes an f64 result to its VGPR pair, after the clamp modifier.
+    fn write_f64(&mut self, inst: &Inst, mut f: V, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.omod != 0 {
+            return Err("an output modifier on an f64 operation");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit result");
+        };
+        let c = self.cur;
+        let f64t = self.s.m.double();
+        if v.clamp {
+            f = self.s.op(c, "unary.f64", Attr::ReadNone, f64t, 7, &[f]);
+        }
+        let i64t = self.s.m.int(64);
+        let x = self.s.m.cast(c, Cast::Bitcast, f, i64t);
+        let (lo, hi) = self.split64(x);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        Ok(())
     }
 
     /// The low and high dwords of an i64.
