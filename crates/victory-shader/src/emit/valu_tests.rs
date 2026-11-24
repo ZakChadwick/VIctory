@@ -69,6 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, 0, 1)
+}
+
+/// [`build_valu_cs`] with `lds_blocks` 512-byte blocks of LDS, in groups of
+/// `threads` threads (each storing its `v0` to the same dword).
+fn build_cs(body: &[u32], lds_blocks: u32, threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -116,8 +122,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            rsrc2: 5 << 1 | lds_blocks << 15, // 5 user SGPRs: s0..s4
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -936,4 +942,60 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// DS `op vdst, addr, data0, data1 offset0 offset1`.
+const fn ds(
+    op: u8,
+    vdst: u8,
+    addr: u8,
+    data0: u8,
+    data1: u8,
+    offset0: u8,
+    offset1: u8,
+) -> [u32; 2] {
+    [
+        0xD8 << 24 | (op as u32) << 18 | (offset1 as u32) << 8 | offset0 as u32,
+        (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
+/// `ds_wrxchg2_rtn_b32` and `ds_wrxchg2st64_rtn_b32` swap two dwords at
+/// offsets in dwords (or 64-dword units) and return the old ones.
+#[test]
+fn ds_wrxchg2_b32_swaps_two_dwords() {
+    // v1, v2: the old values; v3, v4: the new ones.
+    let cases = [[0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]];
+    // ds_write2_b32 = 0x0E, ds_wrxchg2_rtn_b32 = 0x2E, ds_wrxchg2st64_rtn_b32 =
+    // 0x2F, ds_write2st64_b32 = 0x0F, ds_read_b32 = 0x36.
+    // Each thread's slots are its own: 16 bytes apart for dword offsets 1
+    // and 3, 4 bytes apart for offsets of 64 dwords (256 and 768 bytes).
+    for (name, write2, xchg2, unit, shift) in [
+        ("ds_wrxchg2_rtn_b32", 0x0E, 0x2E, 4u16, 4u16),
+        ("ds_wrxchg2st64_rtn_b32", 0x0F, 0x2F, 256, 2),
+    ] {
+        // Results: the two old values (v6, v7), then the two stored ones.
+        for (k, want) in [(0, 0), (1, 1), (2, 2), (3, 3)] {
+            // 64 threads, so that the group is more than one wave and runs on
+            // hosts of any wave size; each works from v5 = thread << shift and
+            // stores the same value.
+            // v_lshlrev_b32 v5, shift, v0 (VOP3 0x11A; inline constants 128+)
+            let mut body = vop3(0x11A, 5, 128 + shift, vgpr(0), 0).to_vec();
+            body.extend(ds(write2, 0, 5, 1, 2, 1, 3)); // [1] = v1, [3] = v2
+            body.extend(ds(xchg2, 6, 5, 3, 4, 1, 3));
+            body.push(0xBF8C_0000); // s_waitcnt 0
+            match k {
+                0 | 1 => body.push(vop1(0x001, 0, vgpr(6 + k as u8))),
+                _ => {
+                    let off = if k == 2 { unit } else { 3 * unit };
+                    let [w0, w1] = ds(0x36, 0, 5, 0, 0, off as u8, (off >> 8) as u8);
+                    body.extend([w0, w1, 0xBF8C_0000]);
+                }
+            }
+            let shader = build_cs(&body, 4, 64);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                assert_eq!(got, inp[want], "{backend}: {name} result {k}");
+            });
+        }
+    }
 }

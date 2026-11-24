@@ -2063,6 +2063,7 @@ impl<'a> Lower<'a> {
 
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        use super::bitcode::Rmw;
         let Fields::Ds {
             dst,
             addr,
@@ -2201,12 +2202,39 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
+        if matches!(name, "ds_wrxchg2_rtn_b32" | "ds_wrxchg2st64_rtn_b32") {
+            // Two exchanges at the scaled offsets; the old values return in
+            // the destination pair.
+            let reg = dst_reg.ok_or("an LDS exchange result")?;
+            let mut vals = Vec::new();
+            for e in 0..2 {
+                vals.push(self.vgprs(inst, data.get(e).ok_or("an LDS exchange")?, 1)?[0]);
+            }
+            let mut outside = Vec::new();
+            for k in 0..2 {
+                let old = inst.read(Reg::V(reg + k)).map(|v| self.i32_of(v));
+                outside.push(match old {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.i32(0),
+                });
+            }
+            let at = self.begin_guarded(guard);
+            let mut rs = Vec::new();
+            for ((off, _), (x, o)) in pair(name).into_iter().zip(vals.into_iter().zip(outside)) {
+                let p = dword(self, off);
+                rs.push((self.s.m.atomic(self.cur, Rmw::Xchg, p, x), o));
+            }
+            let rs = self.end_guarded(at, &rs);
+            for (k, r) in rs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), r, None);
+            }
+            return Ok(());
+        }
         // Atomics: the old value returns with `_rtn`.
         let op = name
             .strip_prefix("ds_")
             .map(|n| n.replace("_rtn", ""))
             .ok_or("an LDS operation")?;
-        use super::bitcode::Rmw;
         let rmw = match op.as_str() {
             "add_u32" => Some(Rmw::Add),
             "sub_u32" => Some(Rmw::Sub),
