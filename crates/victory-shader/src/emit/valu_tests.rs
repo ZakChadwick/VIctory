@@ -937,3 +937,62 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `s_bfe_u64`/`s_bfe_i64` extract a field of src0 (offset src1[5:0], width
+/// src1[22:16]) zero- or sign-extended; `s_bfm_b64` makes a 64-bit mask.
+#[test]
+fn scalar_64_bit_bitfields() {
+    fn bfe(x: u64, f: u32, signed: bool) -> u64 {
+        let (off, w) = (f & 63, f >> 16 & 0x7F);
+        let t = if signed {
+            ((x as i64) >> off) as u64
+        } else {
+            x >> off
+        };
+        match w {
+            0 => 0,
+            64.. => t,
+            _ if signed => (((t << (64 - w)) as i64) >> (64 - w)) as u64,
+            _ => t << (64 - w) >> (64 - w),
+        }
+    }
+    let field = |off: u32, w: u32| off | w << 16;
+    let cases = [
+        [0x89AB_CDEF, 0x0123_4567, field(4, 8), 0],
+        [0x89AB_CDEF, 0x8123_4567, field(28, 12), 0],
+        [0x0000_0000, 0x8000_0000, field(60, 4), 0],
+        [0xFFFF_0000, 0x7FFF_FFFF, field(40, 40), 0],
+        [0xDEAD_BEEF, 0xCAFE_F00D, field(0, 64), 0],
+        [0xDEAD_BEEF, 0xCAFE_F00D, field(8, 100), 0],
+        [0xDEAD_BEEF, 0xCAFE_F00D, field(3, 0), 0],
+        [0xDEAD_BEEF, 0xCAFE_F00D, field(63, 1), 0],
+    ];
+    // SOP2 s_bfe_u64 = 0x29, s_bfe_i64 = 0x2A: s[6:7] = bfe(s[0:1], s2).
+    for (name, op) in [("s_bfe_u64", 0x29), ("s_bfe_i64", 0x2A)] {
+        for half in 0..2u8 {
+            let body = [sop2(op, 6, 0, 2), vop1(0x001, 0, sgpr(6 + half))];
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let x = u64::from(inp[1]) << 32 | u64::from(inp[0]);
+                let want = (bfe(x, inp[2], op == 0x2A) >> (32 * half)) as u32;
+                assert_eq!(got, want, "{backend}: {name} dword {half} {inp:x?}");
+            });
+        }
+    }
+    // SOP2 s_bfm_b64 = 0x25: s[6:7] = ((1 << s0[5:0]) - 1) << s1[5:0].
+    let masks = [
+        [0, 0, 0, 0],
+        [8, 4, 0, 0],
+        [40, 10, 0, 0],
+        [63, 1, 0, 0],
+        [0x45, 0x83, 0, 0],
+    ];
+    for half in 0..2u8 {
+        let shader = build_valu_cs(&[sop2(0x25, 6, 0, 1), vop1(0x001, 0, sgpr(6 + half))]);
+        run_cases(&shader, &masks, |backend, _, inp, got| {
+            let m = ((1u64 << (inp[0] & 63)) - 1) << (inp[1] & 63);
+            let want = (m >> (32 * half)) as u32;
+            assert_eq!(got, want, "{backend}: s_bfm_b64 dword {half} {inp:x?}");
+        });
+    }
+}

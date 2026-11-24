@@ -2546,6 +2546,65 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bfe_u64" | "s_bfe_i64" | "s_bfm_b64" => {
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let (k63, k64) = (self.s.m.i32(63), self.s.m.i32(64));
+                    let wide = |l: &mut Self, x: V| {
+                        let x = l.s.m.bin(c, Bin::And, x, k63);
+                        l.s.m.cast(c, Cast::ZExt, x, i64t)
+                    };
+                    let r = if name == "s_bfm_b64" {
+                        // ((1 << src0[5:0]) - 1) << src1[5:0]
+                        let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                        let (a, b) = (wide(self, a), wide(self, b));
+                        let one = self.s.m.int_const(i64t, 1);
+                        let m = self.s.m.bin(c, Bin::Shl, one, a);
+                        let m = self.s.m.bin(c, Bin::Sub, m, one);
+                        self.s.m.bin(c, Bin::Shl, m, b)
+                    } else {
+                        // src1: offset in bits 0-5, width in bits 16-22; the
+                        // field's top bit is its sign for the signed form.
+                        let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                        let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                        let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                        let b = self.s.m.bin(c, Bin::Shl, b, k32);
+                        let x = self.s.m.bin(c, Bin::Or, a, b);
+                        let f = src32(self, 1)?;
+                        let off = wide(self, f);
+                        let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
+                        let w = self.s.m.bin(c, Bin::LShr, f, k16);
+                        let w = self.s.m.bin(c, Bin::And, w, k127);
+                        let op = if name == "s_bfe_i64" {
+                            Bin::AShr
+                        } else {
+                            Bin::LShr
+                        };
+                        let t = self.s.m.bin(c, op, x, off);
+                        // Keep the low w bits: shift them to the top and back.
+                        let full = self.s.m.cmp(c, pred::IUGE, w, k64);
+                        let z = self.s.m.i32(0);
+                        let sh = self.s.m.bin(c, Bin::Sub, k64, w);
+                        let sh = self.s.m.select(c, full, z, sh);
+                        let sh = self.s.m.cast(c, Cast::ZExt, sh, i64t);
+                        let t = self.s.m.bin(c, Bin::Shl, t, sh);
+                        let t = self.s.m.bin(c, op, t, sh);
+                        let none = self.s.m.cmp(c, pred::EQ, w, z);
+                        let z64 = self.s.m.int_const(i64t, 0);
+                        self.s.m.select(c, none, z64, t)
+                    };
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    if name != "s_bfm_b64" {
+                        let s = nonzero(self, rl, rh);
+                        self.set(scc, Val::Bit(s));
+                    }
+                    Ok(())
+                }
                 "s_mov_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     self.set(lo, Val::I32(a));
