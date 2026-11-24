@@ -1015,3 +1015,73 @@ fn f64_arithmetic_matches_ieee() {
         }
     }
 }
+
+/// f64 truncation, floor, ceiling, round to nearest even and fract, worked
+/// on the bits (DXIL has no double rounding operations).
+#[test]
+fn f64_rounding() {
+    let doubles = [
+        0.0,
+        -0.0,
+        0.4,
+        -0.4,
+        0.5,
+        -0.5,
+        1.5,
+        2.5,
+        -2.5,
+        1.0 - f64::EPSILON / 2.0,
+        -1e-300,
+        123456.789,
+        -123456.789,
+        4503599627370495.5,
+        4503599627370497.0,
+        1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let cases: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|d| {
+            let b = d.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    let fract = |d: f64| {
+        let (r, below) = (d - d.floor(), f64::from_bits(0x3FEF_FFFF_FFFF_FFFF));
+        if r >= below { below } else { r }
+    };
+    type Model = fn(f64) -> f64;
+    // VOP1: v_trunc_f64 0x17, v_ceil_f64 0x18, v_rndne_f64 0x19,
+    // v_floor_f64 0x1A, v_fract_f64 0x3E.
+    let ops: [(&str, u16, Model); 5] = [
+        ("v_trunc_f64", 0x17, f64::trunc),
+        ("v_ceil_f64", 0x18, f64::ceil),
+        ("v_rndne_f64", 0x19, f64::round_ties_even),
+        ("v_floor_f64", 0x1A, f64::floor),
+        ("v_fract_f64", 0x3E, fract),
+    ];
+    for (name, op, f) in ops {
+        for half in 0..2 {
+            let mut body = vec![vop1(op, 0, vgpr(1))];
+            if half == 1 {
+                body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+            }
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let d = f64::from_bits(u64::from(inp[1]) << 32 | u64::from(inp[0]));
+                let want = f(d);
+                if want.is_nan() || (name == "v_fract_f64" && d.is_infinite()) {
+                    // Any NaN: compare the exponent and a nonzero fraction.
+                    if half == 1 {
+                        assert_eq!(got & 0x7FF0_0000, 0x7FF0_0000, "{backend}: {name} {d:e}");
+                    }
+                } else {
+                    let want = (want.to_bits() >> (32 * half)) as u32;
+                    assert_eq!(got, want, "{backend}: {name} {d:e} dword {half}");
+                }
+            });
+        }
+    }
+}

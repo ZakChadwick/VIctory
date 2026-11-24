@@ -1400,6 +1400,84 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, zeros, signed, r)
     }
 
+    /// `v_{trunc,floor,ceil,rndne,fract}_f64` of `x`, which DXIL has no
+    /// double overloads for: truncation clears the fraction bits, nearest
+    /// even adds and subtracts 2^52, and fract is x - floor(x) kept below 1.
+    fn round64(&mut self, name: &str, x: V) -> V {
+        let c = self.cur;
+        let (f64t, i64t) = (self.s.m.double(), self.s.m.int(64));
+        let k = |l: &mut Self, n: i64| l.s.m.int_const(i64t, n);
+        let kf = |l: &mut Self, f: f64| {
+            let b = l.s.m.int_const(i64t, f.to_bits() as i64);
+            l.s.m.cast(c, Cast::Bitcast, b, f64t)
+        };
+        let bits = self.s.m.cast(c, Cast::Bitcast, x, i64t);
+        let sign = k(self, i64::MIN);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign);
+        let trunc = |l: &mut Self| {
+            // Exponent e: below 0 only the sign stays; from 52 the value is
+            // whole (infinities and NaN too); between, 52 - e bits clear.
+            let (k52, k7ff, k1023) = (k(l, 52), k(l, 0x7FF), k(l, 1023));
+            let e = l.s.m.bin(c, Bin::LShr, bits, k52);
+            let e = l.s.m.bin(c, Bin::And, e, k7ff);
+            let e = l.s.m.bin(c, Bin::Sub, e, k1023);
+            let z = k(l, 0);
+            let small = l.s.m.cmp(c, pred::SLT, e, z);
+            let whole = l.s.m.cmp(c, pred::SGT, e, k52);
+            let e = l.s.m.select(c, whole, k52, e);
+            let e = l.s.m.select(c, small, z, e);
+            let sh = l.s.m.bin(c, Bin::Sub, k52, e);
+            let one = k(l, 1);
+            let m = l.s.m.bin(c, Bin::Shl, one, sh);
+            let m = l.s.m.bin(c, Bin::Sub, m, one);
+            let ones = k(l, -1);
+            let m = l.s.m.bin(c, Bin::Xor, m, ones);
+            let r = l.s.m.bin(c, Bin::And, bits, m);
+            let r = l.s.m.select(c, small, sign, r);
+            l.s.m.cast(c, Cast::Bitcast, r, f64t)
+        };
+        match name {
+            "v_trunc_f64" => trunc(self),
+            "v_rndne_f64" => {
+                // |x| < 2^52 rounds by adding and subtracting 2^52 (nearest
+                // even); the sign is put back so -0.4 gives -0.
+                let mag = k(self, i64::MAX);
+                let mag = self.s.m.bin(c, Bin::And, bits, mag);
+                let ax = self.s.m.cast(c, Cast::Bitcast, mag, f64t);
+                let big = kf(self, 4_503_599_627_370_496.0);
+                let t = self.s.m.bin(c, Bin::Add, ax, big);
+                let t = self.s.m.bin(c, Bin::Sub, t, big);
+                let tb = self.s.m.cast(c, Cast::Bitcast, t, i64t);
+                let tb = self.s.m.bin(c, Bin::Or, tb, sign);
+                let t = self.s.m.cast(c, Cast::Bitcast, tb, f64t);
+                let fits = self.s.m.cmp(c, pred::OLT, ax, big);
+                self.s.m.select(c, fits, t, x)
+            }
+            _ => {
+                let t = trunc(self);
+                let one = kf(self, 1.0);
+                let ceil = name == "v_ceil_f64";
+                // trunc moved x up (floor: a negative fraction) or down.
+                let p = if ceil { pred::OGT } else { pred::OLT };
+                let moved = self.s.m.cmp(c, p, x, t);
+                let step = if ceil {
+                    self.s.m.bin(c, Bin::Add, t, one)
+                } else {
+                    self.s.m.bin(c, Bin::Sub, t, one)
+                };
+                let r = self.s.m.select(c, moved, step, t);
+                if name != "v_fract_f64" {
+                    return r;
+                }
+                // At most the largest f64 below 1; infinities give NaN.
+                let f = self.s.m.bin(c, Bin::Sub, x, r);
+                let below = kf(self, f64::from_bits(0x3FEF_FFFF_FFFF_FFFF));
+                let over = self.s.m.cmp(c, pred::OGE, f, below);
+                self.s.m.select(c, over, below, f)
+            }
+        }
+    }
+
     /// [`Self::max_min`] for f64: DXIL's FMax/FMin, with -0 below +0.
     fn max_min64(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
@@ -3784,6 +3862,11 @@ impl<'a> Lower<'a> {
                     }
                     _ => self.max_min64(name == "v_max_f64", a, b),
                 };
+                self.write_f64(inst, r, guard)
+            }
+            "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_fract_f64" => {
+                let a = self.fsrc64(inst, 0)?;
+                let r = self.round64(name, a);
                 self.write_f64(inst, r, guard)
             }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
