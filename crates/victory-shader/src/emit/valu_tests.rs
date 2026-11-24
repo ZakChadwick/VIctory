@@ -937,3 +937,33 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_cvt_pk_u16_u32` and `v_cvt_pk_i16_i32` saturate each dword to 16 bits
+/// and pack src0 into the low half and src1 into the high half.
+#[test]
+fn cvt_pk_16_32_saturates_and_packs() {
+    let cases = [
+        [0x0000_1234, 0x0000_ABCD, 0, 0],
+        [0x0001_0000, 0xFFFF_FFFF, 0, 0],
+        [0x0000_7FFF, 0x0000_8000, 0, 0],
+        [0xFFFF_8000, 0xFFFF_7FFF, 0, 0],
+        [0x8000_0000, 0x7FFF_FFFF, 0, 0],
+    ];
+    for (name, op, signed) in [
+        ("v_cvt_pk_u16_u32", 0x36a, false),
+        ("v_cvt_pk_i16_i32", 0x36b, true),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let sat = |w: u32| {
+                if signed {
+                    (w as i32).clamp(-32768, 32767) as u32 & 0xFFFF
+                } else {
+                    w.min(0xFFFF)
+                }
+            };
+            let want = sat(inp[0]) | sat(inp[1]) << 16;
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}

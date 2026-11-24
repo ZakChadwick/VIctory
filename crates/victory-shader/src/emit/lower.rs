@@ -5177,6 +5177,31 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 self.s.m.bin(c, Bin::Shl, m, b)
             }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // Each source saturated to 16 bits: src0 in the low half,
+                // src1 in the high half.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_cvt_pk_i16_i32";
+                let mut sat = |x| {
+                    if signed {
+                        let (lo, hi) = (k(self, 0xFFFF_8000), k(self, 0x7FFF));
+                        let t = self.s.m.cmp(c, pred::SLT, x, lo);
+                        let x = self.s.m.select(c, t, lo, x);
+                        let t = self.s.m.cmp(c, pred::SGT, x, hi);
+                        let x = self.s.m.select(c, t, hi, x);
+                        let m = k(self, 0xFFFF);
+                        self.s.m.bin(c, Bin::And, x, m)
+                    } else {
+                        let hi = k(self, 0xFFFF);
+                        let t = self.s.m.cmp(c, pred::IUGT, x, hi);
+                        self.s.m.select(c, t, hi, x)
+                    }
+                };
+                let (lo, hi) = (sat(a), sat(b));
+                let k16 = k(self, 16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                self.s.m.bin(c, Bin::Or, lo, hi)
+            }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into
                 // byte src1[1:0] of src2.
