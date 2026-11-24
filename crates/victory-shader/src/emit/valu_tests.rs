@@ -1041,3 +1041,88 @@ fn image_sample_c_lz_compares_one_texel() {
         },
     );
 }
+
+/// `image_gather4_c_lz` compares the reference with the four texels around
+/// the coordinates, in D3D's gather order: (0, 1), (1, 1), (1, 0), (0, 0).
+#[test]
+fn image_gather4_c_lz_compares_four_texels() {
+    // A 2x2 R32_FLOAT texture: 0.1 0.2 / 0.3 0.4.
+    let texels = [0.1f32, 0.2, 0.3, 0.4];
+    let f = f32::to_bits;
+    // v1 = reference, v2, v3 = u, v: the centre, between all four texels.
+    let cases = [
+        [f(0.0), f(0.5), f(0.5), 0],
+        [f(0.25), f(0.5), f(0.5), 0],
+        [f(0.35), f(0.5), f(0.5), 0],
+        [f(0.5), f(0.5), f(0.5), 0],
+    ];
+    // Texels (0, 1), (1, 1), (1, 0), (0, 0) of the 2x2.
+    let gathered = [0.3f32, 0.4, 0.2, 0.1];
+    for k in 0..4u8 {
+        // image_gather4_c_lz v[4:7] = 0x4F (dmask: red); v0 = v[4 + k].
+        let mut body = mimg(0x4F, 4, 1, 16, 24, 1).to_vec();
+        body.push(0xBF8C_0000);
+        body.push(vop1(0x001, 0, vgpr(4 + k)));
+        // LESSEQUAL = 3: reference <= texel.
+        let shader = image_cs(3, &body);
+        run_with(
+            &shader,
+            &cases,
+            &[View::FloatTexture(2, 2, &texels)],
+            |backend, _, inp, got| {
+                let reference = f32::from_bits(inp[0]);
+                let want = if reference <= gathered[usize::from(k)] {
+                    1.0
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    f32::from_bits(got),
+                    want,
+                    "{backend}: texel {k}, reference {reference}"
+                );
+            },
+        );
+    }
+}
+
+/// `image_gather4_c_lz_o` applies its texel offset (x in bits 0-5 of the
+/// first address) before the comparison; the sampler clamps to the edge.
+#[test]
+fn image_gather4_c_lz_o_offsets_the_footprint() {
+    let texels = [0.1f32, 0.2, 0.3, 0.4];
+    let f = f32::to_bits;
+    // v1 = offset (+1, 0), v2 = reference, v3, v4 = u, v.
+    let cases = [
+        [1, f(0.15), f(0.5), f(0.5)],
+        [1, f(0.3), f(0.5), f(0.5)],
+        [1, f(0.45), f(0.5), f(0.5)],
+    ];
+    // One texel right, clamped: (1, 1), (1, 1), (1, 0), (1, 0).
+    let gathered = [0.4f32, 0.4, 0.2, 0.2];
+    for k in 0..4u8 {
+        // image_gather4_c_lz_o v[4:7] = 0x5F (dmask: red); v0 = v[4 + k].
+        let mut body = mimg(0x5F, 4, 1, 16, 24, 1).to_vec();
+        body.push(0xBF8C_0000);
+        body.push(vop1(0x001, 0, vgpr(4 + k)));
+        let shader = image_cs(3, &body);
+        run_with(
+            &shader,
+            &cases,
+            &[View::FloatTexture(2, 2, &texels)],
+            |backend, _, inp, got| {
+                let reference = f32::from_bits(inp[1]);
+                let want = if reference <= gathered[usize::from(k)] {
+                    1.0
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    f32::from_bits(got),
+                    want,
+                    "{backend}: texel {k}, reference {reference}"
+                );
+            },
+        );
+    }
+}

@@ -5789,6 +5789,7 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4_c_lz" | "image_gather4_c_lz_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -5841,7 +5842,7 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
@@ -6034,14 +6035,16 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    let name = if op == 74 {
+                        // The reference comes before the coordinates.
+                        let reference = addr_val(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                        "textureGatherCmp.f32"
+                    } else {
+                        "textureGather.f32"
+                    };
+                    self.s
+                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
             }
         } else {
@@ -6073,7 +6076,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
