@@ -1015,3 +1015,81 @@ fn f64_arithmetic_matches_ieee() {
         }
     }
 }
+
+/// f64 compares (VOPC through VOP3, into an SGPR pair), ordered and
+/// unordered, with NaNs, signed zeros and values only f64 tells apart.
+#[test]
+fn f64_compares() {
+    use std::cmp::Ordering::{Greater, Less};
+    let pairs = |a: f64, b: f64| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    };
+    let one_plus = 1.0 + f64::EPSILON;
+    let values = [
+        (1.0, 2.0),
+        (2.0, 1.0),
+        (1.0, one_plus), // equal as f32
+        (0.0, -0.0),
+        (f64::NAN, 1.0),
+        (1.0, f64::NAN),
+        (f64::NEG_INFINITY, f64::MIN),
+    ];
+    let cases: Vec<[u32; 4]> = values.iter().map(|&(a, b)| pairs(a, b)).collect();
+    type Model = fn(f64, f64) -> bool;
+    let ops: [(&str, u16, Model); 6] = [
+        ("v_cmp_lt_f64", 0x21, |a, b| a < b),
+        ("v_cmp_eq_f64", 0x22, |a, b| a == b),
+        ("v_cmp_lg_f64", 0x25, |a, b| {
+            matches!(a.partial_cmp(&b), Some(Less | Greater))
+        }),
+        ("v_cmp_u_f64", 0x28, |a, b| a.is_nan() || b.is_nan()),
+        ("v_cmp_nlt_f64", 0x2E, |a, b| {
+            a.partial_cmp(&b) != Some(Less)
+        }),
+        ("v_cmp_neq_f64", 0x2D, |a, b| a != b),
+    ];
+    for (name, op, f) in ops {
+        // v_cmp_*_f64_e64 s6, v[1:2], v[3:4]; v_cndmask_b32_e64 v0, 0, 1, s6
+        let [c0, c1] = vop3(op, 6, vgpr(1), vgpr(3), 0);
+        let [m0, m1] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        let shader = build_valu_cs(&[c0, c1, m0, m1]);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let (a, b) = values[i];
+            assert_eq!(got, u32::from(f(a, b)), "{backend}: {name} ({a:e}, {b:e})");
+        });
+    }
+}
+
+/// `v_cmp_class_f64` tests each of the 10 classes, telling denormals and
+/// NaNs apart by fraction bits in the low dword too.
+#[test]
+fn v_cmp_class_f64_matches_rdna2() {
+    let classes: &[(u64, u32)] = &[
+        (0x7FF0_0000_0000_0001, 0), // sNaN, only a low fraction bit
+        (0xFFF0_0000_8000_0000, 0), // -sNaN
+        (0x7FF8_0000_0000_0000, 1), // qNaN
+        (0xFFF0_0000_0000_0000, 2), // -inf
+        (0xBFF0_0000_0000_0000, 3), // -1.0
+        (0x8000_0000_0000_0001, 4), // -denormal, only a low fraction bit
+        (0x8000_0000_0000_0000, 5), // -0
+        (0x0000_0000_0000_0000, 6), // +0
+        (0x000F_FFFF_0000_0000, 7), // +denormal, only high fraction bits
+        (0x3FF0_0000_0000_0000, 8), // +1.0
+        (0x7FF0_0000_0000_0000, 9), // +inf
+    ];
+    let mut cases = Vec::new();
+    for &(bits, class) in classes {
+        let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+        cases.push(([lo, hi, 1 << class, 0], 1));
+        cases.push(([lo, hi, !(1 << class) & 0x3FF, 0], 0));
+    }
+    // v_cmp_class_f64_e64 s6, v[1:2], v3 (VOP3 0x0A8); v_cndmask_b32_e64 v0, 0, 1, s6
+    let [c0, c1] = vop3(0x0A8, 6, vgpr(1), vgpr(3), 0);
+    let [m0, m1] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+    let shader = build_valu_cs(&[c0, c1, m0, m1]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(got, cases[i].1, "{backend}: v_cmp_class_f64 {inp:x?}");
+    });
+}

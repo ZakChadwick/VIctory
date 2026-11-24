@@ -5380,9 +5380,11 @@ impl<'a> Lower<'a> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" | "f16" if op == "class" => {
+            "f32" | "f16" | "f64" if op == "class" => {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+                // An f64 is tested by its high dword, bit 0 set if any bit of
+                // the low dword is (it is fraction only).
                 let f16 = ty == "f16";
                 let x = if f16 {
                     let Fields::Valu(v) = &inst.fields else {
@@ -5398,16 +5400,25 @@ impl<'a> Lower<'a> {
                         h = self.s.m.bin(c, Bin::Xor, h, s);
                     }
                     h
+                } else if ty == "f64" {
+                    let d = self.fsrc64(inst, 0)?;
+                    let i64t = self.s.m.int(64);
+                    let bits = self.s.m.cast(c, Cast::Bitcast, d, i64t);
+                    let (lo, hi) = self.split64(bits);
+                    let zero = self.s.m.i32(0);
+                    let any = self.s.m.cmp(c, pred::NE, lo, zero);
+                    let any = self.s.m.cast(c, Cast::ZExt, any, self.s.t.i32);
+                    self.s.m.bin(c, Bin::Or, hi, any)
                 } else {
                     let x = self.fsrc(inst, 0)?;
                     self.as_int(x)
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
-                    (10, 15, 0x1F, 0x03FF, 0x0200)
-                } else {
-                    (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000)
+                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = match ty {
+                    "f16" => (10, 15, 0x1F, 0x03FF, 0x0200),
+                    "f64" => (20, 31, 0x7FF, 0xF_FFFF, 0x8_0000),
+                    _ => (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000),
                 };
                 let (k_exp, k_sign, k_emax, mant, quiet) = (
                     k(self, exp_sh),
@@ -5448,11 +5459,11 @@ impl<'a> Lower<'a> {
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
-            "f32" | "f16" => {
-                let (a, b) = if ty == "f16" {
-                    (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
-                } else {
-                    (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
+            "f32" | "f16" | "f64" if op != "class" => {
+                let (a, b) = match ty {
+                    "f16" => (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?),
+                    "f64" => (self.fsrc64(inst, 0)?, self.fsrc64(inst, 1)?),
+                    _ => (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?),
                 };
                 if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
