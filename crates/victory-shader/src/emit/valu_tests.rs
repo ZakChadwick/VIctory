@@ -69,6 +69,11 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, &[])
+}
+
+/// [`build_valu_cs`] with more descriptors in the table at `s[4:5]`.
+fn build_cs(body: &[u32], more: &[UsedResource]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -105,7 +110,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
                 slot: 1,
             },
         ],
-        used: vec![UsedResource {
+        used: [UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -114,7 +119,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             dwords: 4,
             user_data: 4,
             slot: 1,
-        }],
+        }]
+        .into_iter()
+        .chain(more.iter().copied())
+        .collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
@@ -144,8 +152,19 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        static_samplers: lowered
+            .samplers
+            .iter()
+            .enumerate()
+            .map(|(n, &w)| {
+                let mut s = super::sampler::StaticSampler::from_words(w);
+                if lowered.cmp_samplers >> n & 1 != 0 {
+                    s.filter |= 0x80;
+                }
+                s
+            })
+            .collect(),
         samplers: lowered.samplers,
-        static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
     };
@@ -172,8 +191,22 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_with(shader, cases, &[], check);
+}
+
+/// [`run_cases`] with `more` views in the heap after the result UAV.
+fn run_with(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    more: &[View],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    let views: Vec<View> = [View::RawUav(1)]
+        .into_iter()
+        .chain(more.iter().copied())
+        .collect();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -199,7 +232,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -936,4 +969,75 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// SOP1 `s_mov_b32 sdst, literal`.
+const fn s_mov_lit(sdst: u8, lit: u32) -> [u32; 2] {
+    [0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | 255, lit]
+}
+
+/// MIMG `op vdata, vaddr, s[srsrc:+7], s[ssamp:+3] dmask dim:2D` (no NSA).
+const fn mimg(op: u8, vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+    [
+        0x3C << 26 | ((op & 0x7F) as u32) << 18 | (dmask as u32) << 8 | 1 << 3 | (op >> 7) as u32,
+        (vaddr as u32)
+            | (vdata as u32) << 8
+            | ((srsrc >> 2) as u32) << 16
+            | ((ssamp >> 2) as u32) << 21,
+    ]
+}
+
+/// The SRV at heap index 1 that the image tests read through `s[16:23]`.
+const IMAGE_SRV: UsedResource = UsedResource {
+    kind: ResourceType::Srv,
+    root: RootType::Table,
+    table_offset_dwords: 8,
+    lower_bound: 0,
+    stride: 0,
+    dwords: 8,
+    user_data: 4,
+    slot: 1,
+};
+
+/// A program that loads the T# at heap index 1 into `s[16:23]`, sets a
+/// point-filtered, clamped sampler comparing with `func` in `s[24:27]`, runs
+/// `body` (the result in `v0`) and stores `v0`.
+fn image_cs(func: u32, body: &[u32]) -> HostShader {
+    // s_load_dwordx8 s[16:23], s[4:5], 32
+    let mut words = vec![0x3D << 26 | 0x03 << 18 | 16 << 6 | 2, 125 << 25 | 32];
+    // S#: clamp to edge in x, y and z; the compare function; point filters.
+    words.extend(s_mov_lit(24, 2 | 2 << 3 | 2 << 6 | func << 12));
+    words.extend(s_mov_lit(25, 0));
+    words.extend(s_mov_lit(26, 0));
+    words.extend(s_mov_lit(27, 0));
+    words.extend_from_slice(body);
+    words.push(0xBF8C_0000); // s_waitcnt 0
+    build_cs(&words, &[IMAGE_SRV])
+}
+
+/// `image_sample_c_lz` compares the reference (the first address) with the
+/// texel at level 0, as D3D's SampleCmpLevelZero does.
+#[test]
+fn image_sample_c_lz_compares_one_texel() {
+    // A 2x2 R32_FLOAT texture: 0.1 0.2 / 0.3 0.4.
+    let texels = [0.1f32, 0.2, 0.3, 0.4];
+    let f = f32::to_bits;
+    // v1 = reference, v2, v3 = u, v (texel centres).
+    let cases = [
+        [f(0.15), f(0.25), f(0.25), 0], // 0.15 <= 0.1: no
+        [f(0.15), f(0.75), f(0.25), 0], // 0.15 <= 0.2: yes
+        [f(0.35), f(0.75), f(0.75), 0], // 0.35 <= 0.4: yes
+        [f(0.35), f(0.25), f(0.75), 0], // 0.35 <= 0.3: no
+    ];
+    // image_sample_c_lz = 0x2F; LESSEQUAL = 3.
+    let shader = image_cs(3, &mimg(0x2F, 0, 1, 16, 24, 1));
+    run_with(
+        &shader,
+        &cases,
+        &[View::FloatTexture(2, 2, &texels)],
+        |backend, i, _, got| {
+            let want = [0.0f32, 1.0, 1.0, 0.0][i];
+            assert_eq!(f32::from_bits(got), want, "{backend}: case {i}");
+        },
+    );
 }
