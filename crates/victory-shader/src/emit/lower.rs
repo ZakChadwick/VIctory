@@ -6192,9 +6192,13 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
-        // d16: two 16-bit channels per VGPR, low half first.
+        // d16: two 16-bit channels per VGPR, low half first; d16_hi: one
+        // channel in the high half, the low half kept.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
-        let plain = name.replace("_format_d16_", "_format_");
+        let d16_hi = name.starts_with("buffer_load_format_d16_hi_");
+        let plain = name
+            .replace("_format_d16_hi_", "_format_")
+            .replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
@@ -6451,6 +6455,21 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        if d16_hi {
+            let f = self.s.m.extract(c, r, 0);
+            let i32t = self.s.t.i32;
+            let h = self
+                .s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            let old = inst.read(Reg::V(reg)).ok_or("a d16_hi destination")?;
+            let old = self.i32_of(old)?;
+            let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+            let old = self.s.m.bin(c, Bin::And, old, low);
+            let h = self.s.m.bin(c, Bin::Shl, h, k16);
+            let x = self.s.m.bin(c, Bin::Or, old, h);
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);

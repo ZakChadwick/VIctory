@@ -1041,3 +1041,42 @@ fn image_sample_c_lz_compares_one_texel() {
         },
     );
 }
+
+/// `buffer_load_format_d16_hi_x` writes channel x as an f16 into the high
+/// half of its register and keeps the low half.
+#[test]
+fn buffer_load_format_d16_hi_x_keeps_the_low_half() {
+    // A typed RGBA32F buffer SRV at heap index 1, read through s[16:19].
+    let typed = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let body = [
+        // s_load_dwordx4 s[16:19], s[4:5], 32
+        0x3D << 26 | 0x02 << 18 | 16 << 6 | 2,
+        125 << 25 | 32,
+        vop1(0x001, 0, vgpr(1)), // v_mov_b32 v0, v1 (the low half to keep)
+        // buffer_load_format_d16_hi_x v0, off, s[16:19], 0 (MUBUF 0x26)
+        0x38 << 26 | 0x26 << 18,
+        0x80 << 24 | 4 << 16,
+        0xBF8C_0000, // s_waitcnt 0
+    ];
+    let shader = build_cs(&body, &[typed]);
+    for (x, half) in [(1.0f32, 0x3C00u32), (-2.5, 0xC100), (0.0, 0)] {
+        let data = [x.to_bits(), 7f32.to_bits(), 8f32.to_bits(), 9f32.to_bits()];
+        let view = View::Buffer {
+            data: &data,
+            stride: super::host::Stride::Typed,
+        };
+        let cases = [[0xABCD_1234, 0, 0, 0]];
+        run_with(&shader, &cases, &[view], |backend, _, _, got| {
+            assert_eq!(got, half << 16 | 0x1234, "{backend}: x = {x}");
+        });
+    }
+}

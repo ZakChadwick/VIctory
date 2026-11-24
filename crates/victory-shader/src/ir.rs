@@ -874,6 +874,10 @@ fn effects(
                     if !lds {
                         regs(d, &mut w)?;
                     }
+                    // The other half of the register is kept.
+                    if name.contains("_format_d16_hi_") {
+                        regs(d, &mut r)?;
+                    }
                 } else if name.contains("_store_") {
                     regs(d, &mut r)?;
                 } else if name.contains("_atomic_") {
